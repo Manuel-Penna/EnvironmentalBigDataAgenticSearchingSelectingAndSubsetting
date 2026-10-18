@@ -1,0 +1,6 @@
+venv
+nc_files
+zarr_files
+__pycache__
+steps
+files

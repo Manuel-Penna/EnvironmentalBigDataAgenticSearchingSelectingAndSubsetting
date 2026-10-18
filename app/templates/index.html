@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GeoMeta — Geospatial Dataset Catalog</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+
+    <!-- ── SIDEBAR ─────────────────────────────────────────── -->
+    <aside class="sidebar">
+        <div class="sidebar-logo">
+            <span class="logo-mark">⬡</span>
+            <span class="logo-text">GeoMeta</span>
+        </div>
+
+        <nav class="sidebar-nav">
+            <button class="nav-item active" data-view="search">
+                <span class="nav-icon">◈</span>
+                <span>Search</span>
+            </button>
+            <button class="nav-item" data-view="upload">
+                <span class="nav-icon">⊕</span>
+                <span>Extract</span>
+            </button>
+            <button class="nav-item" data-view="browse">
+                <span class="nav-icon">▦</span>
+                <span>Browse</span>
+            </button>
+        </nav>
+
+        <div class="sidebar-footer">
+            <div class="status-indicator" id="api-status">
+                <span class="status-dot"></span>
+                <span class="status-text">Connecting…</span>
+            </div>
+        </div>
+    </aside>
+
+    <!-- ── MAIN ────────────────────────────────────────────── -->
+    <main class="main">
+
+        <!-- SEARCH VIEW -->
+        <section class="view active" id="view-search">
+            <header class="view-header">
+                <h1>Search Catalog</h1>
+                <p class="view-sub">Query datasets by location, time range, or natural language.</p>
+            </header>
+
+            <!-- Mode toggle -->
+            <div class="mode-toggle">
+                <button class="mode-btn active" data-mode="natural">Natural Language</button>
+                <button class="mode-btn" data-mode="structured">Structured</button>
+            </div>
+
+            <!-- Natural language panel -->
+            <div class="search-panel" id="panel-natural">
+                <div class="nl-input-wrap">
+                    <textarea
+                        id="nl-input"
+                        class="nl-input"
+                        placeholder="e.g. NetCDF datasets with sea surface temperature over the Mediterranean in 2020…"
+                        rows="3"
+                    ></textarea>
+                    <button class="btn-primary" id="nl-submit">
+                        <span>Search</span>
+                        <span class="btn-icon">→</span>
+                    </button>
+                </div>
+            </div>
+
+            <!-- Structured panel -->
+            <div class="search-panel hidden" id="panel-structured">
+                <div class="structured-grid">
+                    <div class="field-group">
+                        <label>Format</label>
+                        <select id="s-format">
+                            <option value="">Any</option>
+                            <option value="netcdf">NetCDF</option>
+                            <option value="zarr">Zarr</option>
+                        </select>
+                    </div>
+                    <div class="field-group">
+                        <label>Variable</label>
+                        <input type="text" id="s-variable" placeholder="e.g. temperature">
+                    </div>
+                    <div class="field-group">
+                        <label>Time start</label>
+                        <input type="date" id="s-time-start">
+                    </div>
+                    <div class="field-group">
+                        <label>Time end</label>
+                        <input type="date" id="s-time-end">
+                    </div>
+                    <div class="field-group">
+                        <label>Spatial type</label>
+                        <select id="s-spatial-type">
+                            <option value="">None</option>
+                            <option value="bbox">Bounding box</option>
+                            <option value="point">Point</option>
+                        </select>
+                    </div>
+                </div>
+
+                <!-- Bbox fields -->
+                <div class="spatial-fields hidden" id="bbox-fields">
+                    <div class="structured-grid">
+                        <div class="field-group"><label>Min lat</label><input type="number" id="s-min-lat" step="0.01"></div>
+                        <div class="field-group"><label>Max lat</label><input type="number" id="s-max-lat" step="0.01"></div>
+                        <div class="field-group"><label>Min lon</label><input type="number" id="s-min-lon" step="0.01"></div>
+                        <div class="field-group"><label>Max lon</label><input type="number" id="s-max-lon" step="0.01"></div>
+                    </div>
+                </div>
+
+                <!-- Point fields -->
+                <div class="spatial-fields hidden" id="point-fields">
+                    <div class="structured-grid">
+                        <div class="field-group"><label>Latitude</label><input type="number" id="s-lat" step="0.0001"></div>
+                        <div class="field-group"><label>Longitude</label><input type="number" id="s-lon" step="0.0001"></div>
+                    </div>
+                </div>
+
+                <button class="btn-primary" id="s-submit">
+                    <span>Search</span>
+                    <span class="btn-icon">→</span>
+                </button>
+            </div>
+
+            <!-- Results -->
+            <div class="results-area" id="search-results" hidden>
+                <div class="results-header">
+                    <span class="results-count" id="results-count"></span>
+                    <div class="extracted-filters" id="extracted-filters" hidden>
+                        <span class="filters-label">Filters</span>
+                        <code class="filters-json" id="filters-json"></code>
+                    </div>
+                </div>
+                <div class="dataset-list" id="search-dataset-list"></div>
+            </div>
+        </section>
+
+        <!-- EXTRACT VIEW -->
+        <section class="view" id="view-upload">
+            <header class="view-header">
+                <h1>Extract Metadata</h1>
+                <p class="view-sub">Provide a file path or remote URL to extract and store metadata.</p>
+            </header>
+
+            <div class="extract-form">
+                <div class="field-group full-width">
+                    <label>Source path or URL</label>
+                    <input type="text" id="extract-source" placeholder="/data/myfile.nc  or  https://…">
+                </div>
+                <div class="field-group">
+                    <label>Format</label>
+                    <select id="extract-format">
+                        <option value="netcdf">NetCDF</option>
+                        <option value="zarr">Zarr</option>
+                    </select>
+                </div>
+                <button class="btn-primary" id="extract-submit">
+                    <span>Extract & Save</span>
+                    <span class="btn-icon">⊕</span>
+                </button>
+            </div>
+
+            <div class="extract-result hidden" id="extract-result"></div>
+        </section>
+
+        <!-- BROWSE VIEW -->
+        <section class="view" id="view-browse">
+            <header class="view-header">
+                <h1>Browse Catalog</h1>
+                <p class="view-sub">All datasets currently stored in the catalog.</p>
+            </header>
+
+            <div class="browse-toolbar">
+                <div class="field-group">
+                    <select id="browse-format-filter">
+                        <option value="">All formats</option>
+                        <option value="netcdf">NetCDF</option>
+                        <option value="zarr">Zarr</option>
+                    </select>
+                </div>
+                <button class="btn-secondary" id="browse-refresh">Refresh</button>
+            </div>
+
+            <div class="dataset-list" id="browse-dataset-list"></div>
+        </section>
+
+    </main>
+
+    <!-- ── DATASET DETAIL PANEL ────────────────────────────── -->
+    <div class="detail-overlay hidden" id="detail-overlay">
+        <div class="detail-panel" id="detail-panel">
+            <button class="detail-close" id="detail-close">✕</button>
+            <div class="detail-content" id="detail-content"></div>
+        </div>
+    </div>
+
+    <!-- ── TOAST ───────────────────────────────────────────── -->
+    <div class="toast hidden" id="toast"></div>
+
+    <script src="/static/js/app.js"></script>
+</body>
+</html>
