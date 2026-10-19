@@ -254,3 +254,12 @@ def test_resolve_time_range(env):
                                            "last_unit": "years"})["error"]["code"] == "bad_request"
     assert reg.call("resolve_time_range", {"last_unit": "weeks", "last_amount": 1}
                     )["error"]["code"] == "invalid_arguments"
+
+
+def test_wrapping_arguments_in_a_filters_object_gets_an_actionable_error(env):
+    """Seen in a real llama3.1 run: {"query": ..., "filters": {...}}."""
+    reg, *_ = env
+    r = reg.call("search_catalog", {"query": "sst", "filters": {"region": "Naples"}})
+    msg = r["error"]["message"]
+    assert r["error"]["code"] == "invalid_arguments"
+    assert "unexpected property 'filters'" in msg and "top-level" in msg

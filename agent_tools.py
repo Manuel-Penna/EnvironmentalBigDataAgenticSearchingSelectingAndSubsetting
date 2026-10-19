@@ -87,8 +87,9 @@ def _coerce(schema: dict, value: Any, path: str, errors: list[str]) -> Any:
             elif extra is True:
                 out[k] = v
             else:
+                hint = " Pass them directly as top-level arguments." if path == "arguments" else ""
                 errors.append(f"{path}: unexpected property '{k}' "
-                              f"(allowed: {sorted(props)})")
+                              f"(allowed: {sorted(props)}).{hint}")
         for k, p in props.items():
             if k not in out and "default" in p:
                 out[k] = p["default"]
@@ -576,8 +577,8 @@ def build_registry(ctx: ToolContext) -> ToolRegistry:
     reg.register(Tool(
         "search_catalog",
         "Find datasets in the catalog. 'query' should contain only the topic or variable "
-        "you are looking for (e.g. 'sea surface temperature'); put region, dates and file "
-        "format in the structured filters instead of the query. Datasets are matched by "
+        "you are looking for (e.g. 'sea surface temperature'); give the region as `bbox`, the "
+        "dates as `time` and the file type as `format`, never inside the query. Datasets are matched by "
         "what they describe AND by the variables they contain. Returns compact summaries.",
         {"type": "object", "properties": {
             "query": {"type": "string",

@@ -259,6 +259,94 @@ def test_tool_call_written_as_text_is_bounced(world):
     assert res.format_errors == 1
 
 
+# ---- from a real Groq (gpt-oss-120b) run: stopped after the size check, then claimed success
+CLAIMED_SUCCESS = ("**Subset extraction**\n- Estimated output size: 24 bytes\n- Subset ID: (generated "
+                   "by the system)\n- Verification: Passed, the subset contains valid SST values.")
+
+
+def test_stopping_after_the_size_check_is_challenged(world):
+    reg, _ = world
+    script = [
+        call("estimate_subset_size", **SUBSET_ARGS),
+        AIMessage(content=CLAIMED_SUCCESS),                       # claims a result it does not have
+        call("subset_dataset", **SUBSET_ARGS),
+        lambda m: call("verify_subset", subset_id=last_json(m)["subset_id"]),
+        AIMessage(content="Extracted and verified."),
+    ]
+    res = make_agent(script, reg)[0].run("t")
+    nudge = [m for m in res.messages if isinstance(m, HumanMessage)][-1].content
+    assert "never extracted" in nudge
+    assert res.answer == "Extracted and verified." and res.outcome == "delivered"
+
+
+def test_size_check_nudge_is_limited_and_outcome_exposes_the_gap(world):
+    reg, _ = world
+    script = [call("estimate_subset_size", **SUBSET_ARGS)] + [AIMessage(content=CLAIMED_SUCCESS)] * 3
+    res = make_agent(script, reg)[0].run("t")
+    assert res.ok and res.stop_reason == "final_answer"           # the loop ended normally...
+    assert res.outcome == "no_subset" and res.subsets == []        # ...but nothing was delivered
+
+
+def test_estimate_over_the_limit_does_not_force_an_extraction(world):
+    reg, _ = world
+    big = dict(SUBSET_ARGS, max_bytes=100)                         # exceeds the limit
+    script = [call("estimate_subset_size", **big),
+              AIMessage(content="Too large; narrow the request.")]
+    res = make_agent(script, reg)[0].run("t")
+    assert res.answer == "Too large; narrow the request." and res.steps == 2
+
+
+def test_outcome_values(world):
+    reg, ctx = world
+    verified_script = [call("subset_dataset", **SUBSET_ARGS),
+                       lambda m: call("verify_subset", subset_id=last_json(m)["subset_id"]),
+                       AIMessage(content="ok")]
+    assert make_agent(verified_script, reg)[0].run("t").outcome == "delivered"
+    ctx.catalog.get("med")["variables"][0]["statistics"]["max"] = 5.0   # verification will fail
+    res = make_agent(list(verified_script), reg)[0].run("t")
+    assert res.outcome == "unverified" and res.to_dict()["outcome"] == "unverified"
+    assert make_agent([AIMessage(content="Which variable?")], reg)[0].run("t").outcome == "no_subset"
+
+
+def test_prompt_forbids_placeholders_and_unsupported_claims():
+    assert "never write placeholders" in SYSTEM_PROMPT
+
+
+# verbatim from a real llama3.1 run (the final message that was wrongly accepted as an answer)
+REAL_PROSE_PLUS_JSON = (
+    "To find the sea surface temperature in Naples in 2026, I need to relax the filters one "
+    "at a time. Let's start by dropping the period filter.\n\n"
+    '{"name": "search_catalog", "parameters": {"filters":{"format":"NetCDF","region":"Naples"},'
+    '"query":"sea surface temperature"}}')
+# also verbatim: stray brace, unbalanced JSON, alongside a real structured call
+REAL_BROKEN_JSON = ('} \n\n{"name": "search_catalog", "parameters": {"query": "sea surface '
+                    'temperature", "filters": {"format": "netcdf"}}')
+
+
+def test_prose_followed_by_a_json_call_is_bounced(world):
+    reg, _ = world
+    script = [call("get_dataset", dataset_id="nope"),
+              AIMessage(content=REAL_PROSE_PLUS_JSON),          # was accepted as the answer
+              call("search_catalog", query="sst"), AIMessage(content="done")]
+    res = make_agent(script, reg)[0].run("t")
+    assert res.format_errors == 1 and res.answer == "done" and res.ok
+
+
+def test_text_json_next_to_a_real_tool_call_is_not_a_format_error(world):
+    reg, _ = world
+    both = AIMessage(content=REAL_BROKEN_JSON, tool_calls=[
+        {"name": "resolve_time_range", "args": {"year": "2026"}, "id": "x", "type": "tool_call"}])
+    res = make_agent([both, AIMessage(content="done")], reg)[0].run("t")
+    assert res.format_errors == 0 and res.tool_calls[0]["ok"]
+
+
+def test_prompt_does_not_invite_a_filters_object():
+    """The first real run invented a `filters` argument because the prompt said 'in the filters'."""
+    assert "not a `filters` object" in SYSTEM_PROMPT
+    assert "`bbox`" in SYSTEM_PROMPT and "`time`" in SYSTEM_PROMPT and "`format`" in SYSTEM_PROMPT
+    assert "An error (ok: false) is not an empty result" in SYSTEM_PROMPT
+
+
 def test_text_tool_call_nudges_are_limited(world):
     reg, _ = world
     txt = AIMessage(content='{"name": "search_catalog", "parameters": {}}')

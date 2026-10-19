@@ -81,7 +81,7 @@ def main() -> int:
     result = agent.run(args.task)
 
     print("\n" + (result.answer or "(no answer)"))
-    print(f"\n[{result.stop_reason}] {result.steps} steps, {len(result.tool_calls)} tool calls, "
+    print(f"\n[{result.stop_reason} / {result.outcome}] {result.steps} steps, {len(result.tool_calls)} tool calls, "
           f"{result.elapsed_s:.1f}s, tokens in/out "
           f"{result.usage['input_tokens']}/{result.usage['output_tokens']}, "
           f"format errors {result.format_errors}", file=sys.stderr)
