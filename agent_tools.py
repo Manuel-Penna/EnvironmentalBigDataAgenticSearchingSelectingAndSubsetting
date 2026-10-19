@@ -25,9 +25,11 @@ import math
 import time as _time
 import traceback
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
+
+import pandas as pd
 
 import subsetting as sub
 import verification as ver
@@ -43,6 +45,7 @@ class ToolContext:
     output_dir: str | Path = "subsets"
     default_max_bytes: int = 500_000_000
     provenance_path: str | Path | None = None   # JSONL, appended to on every call
+    today: date | None = None                   # fixed "today" for tests; default: real date
     log: list[dict] = field(default_factory=list)
     subsets: dict[str, dict] = field(default_factory=dict)
 
@@ -536,12 +539,39 @@ def verify_subset(ctx: ToolContext, subset_id: str) -> dict:
             "issues": res["issues"][:20], "variables": summary}
 
 
+def resolve_time_range(ctx: ToolContext, year=None, last_amount=None, last_unit=None) -> dict:
+    """Date arithmetic in code, not in the LLM."""
+    today = ctx.today or date.today()
+    if year is not None and last_amount is None and last_unit is None:
+        start, end = f"{year:04d}-01-01", f"{year:04d}-12-31"
+    elif last_amount is not None and last_unit is not None and year is None:
+        end_ts = pd.Timestamp(today)
+        start_ts = end_ts - pd.DateOffset(**{last_unit: last_amount})
+        start, end = start_ts.date().isoformat(), end_ts.date().isoformat()
+    else:
+        return err("bad_request", "Give either `year`, or both `last_amount` and `last_unit`.")
+    return {"ok": True, "start": start, "end": end, "today": today.isoformat()}
+
+
 # --------------------------------------------------------------------------
 # Registry assembly
 # --------------------------------------------------------------------------
 def build_registry(ctx: ToolContext) -> ToolRegistry:
     reg = ToolRegistry(ctx)
     ds_id = {"type": "string", "description": "A dataset_id returned by search_catalog."}
+
+    reg.register(Tool(
+        "resolve_time_range",
+        "Convert a calendar year ('2019') or a relative period ('the last 5 years') into "
+        "exact start and end dates for the `time` filters. Always use this instead of "
+        "working out dates yourself.",
+        {"type": "object", "properties": {
+            "year": {"type": "integer", "minimum": 1800, "maximum": 2200},
+            "last_amount": {"type": "integer", "minimum": 1,
+                            "description": "With last_unit: 'the last N units' up to today."},
+            "last_unit": {"type": "string", "enum": ["days", "months", "years"]},
+        }},
+        resolve_time_range))
 
     reg.register(Tool(
         "search_catalog",

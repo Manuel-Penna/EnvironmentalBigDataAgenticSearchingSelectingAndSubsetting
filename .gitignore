@@ -4,3 +4,4 @@ zarr_files
 __pycache__
 steps
 files
+.env

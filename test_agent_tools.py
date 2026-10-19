@@ -55,8 +55,8 @@ def env(tmp_path):
 # ------------------------------------------------------------------ schemas
 def test_schemas_for_both_backends(env):
     reg, *_ = env
-    names = {"search_catalog", "get_dataset", "estimate_subset_size",
-             "subset_dataset", "verify_subset"}
+    names = {"resolve_time_range", "search_catalog", "get_dataset",
+             "estimate_subset_size", "subset_dataset", "verify_subset"}
     assert set(reg.names) == names
     for t in reg.anthropic_tools():
         assert t["input_schema"]["type"] == "object" and t["description"]
@@ -235,3 +235,22 @@ def test_to_text_caps_length(env):
     r = reg.call("search_catalog", {})
     assert len(to_text(r, max_chars=100)) < 200
     assert json.loads(to_text(r))["ok"]
+
+
+# ------------------------------------------------------ resolve_time_range
+def test_resolve_time_range(env):
+    import datetime
+    reg, ctx, *_ = env
+    ctx.today = datetime.date(2026, 10, 19)
+    assert reg.call("resolve_time_range", {"year": 2019})["start"] == "2019-01-01"
+    r = reg.call("resolve_time_range", {"year": "2019"})          # coerced
+    assert (r["start"], r["end"]) == ("2019-01-01", "2019-12-31")
+    r = reg.call("resolve_time_range", {"last_amount": 5, "last_unit": "years"})
+    assert (r["start"], r["end"]) == ("2021-10-19", "2026-10-19")
+    r = reg.call("resolve_time_range", {"last_amount": 3, "last_unit": "months"})
+    assert r["start"] == "2026-07-19"
+    assert reg.call("resolve_time_range", {})["error"]["code"] == "bad_request"
+    assert reg.call("resolve_time_range", {"year": 2019, "last_amount": 2,
+                                           "last_unit": "years"})["error"]["code"] == "bad_request"
+    assert reg.call("resolve_time_range", {"last_unit": "weeks", "last_amount": 1}
+                    )["error"]["code"] == "invalid_arguments"
