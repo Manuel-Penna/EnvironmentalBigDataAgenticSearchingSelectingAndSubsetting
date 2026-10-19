@@ -10,8 +10,8 @@ import numpy as np
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
-from agent import (DEFAULT_GROQ_MODEL, GeoMetaAgent, make_groq_llm,
-                   messages_to_dicts)
+from agent import (DEFAULT_GROQ_MODEL, DEFAULT_OLLAMA_MODEL, SYSTEM_PROMPT, GeoMetaAgent,
+                   make_groq_llm, make_llm, make_ollama_llm, messages_to_dicts, model_name)
 from agent_tools import ToolContext, build_registry
 from catalog_adapters import InMemoryCatalog
 from test_agent_tools import record_from_ds
@@ -210,8 +210,8 @@ def test_invalid_tool_calls_field_is_recovered(world):
     reg, _ = world
     broken = AIMessage(content="", invalid_tool_calls=[
         {"name": "search_catalog", "args": "{bad json", "id": "1", "error": "bad", "type": "invalid_tool_call"}])
-    res = make_agent([broken, AIMessage(content="ok")], reg)[0].run("t")
-    assert res.ok and res.steps == 2
+    res = make_agent([broken, call("search_catalog"), AIMessage(content="ok")], reg)[0].run("t")
+    assert res.ok and res.steps == 3 and res.format_errors == 1
 
 
 def test_malformed_recovery_is_limited(world):
@@ -241,6 +241,159 @@ def test_messages_to_dicts_roundtrips_to_json(world):
     d = messages_to_dicts(res.messages)
     assert d[0]["role"] == "system" and d[2]["tool_calls"][0]["name"] == "search_catalog"
     json.dumps(d)
+
+
+# ------------------------------------------- guards for small local models
+def test_tool_call_written_as_text_is_bounced(world):
+    reg, _ = world
+    as_json = AIMessage(content='{"name": "search_catalog", "parameters": {"query": "sst"}}')
+    as_fence = AIMessage(content='```json\n{"name": "get_dataset", "arguments": {"dataset_id": "med"}}\n```')
+    as_tag = AIMessage(content='<tool_call>{"name": "search_catalog"}</tool_call>')
+    script = [as_json, as_fence, call("search_catalog", query="sst"), AIMessage(content="done")]
+    res = make_agent(script, reg)[0].run("t")
+    assert res.ok and res.answer == "done"
+    assert res.format_errors == 2 and [c["name"] for c in res.tool_calls] == ["search_catalog"]
+    assert any("plain text" in m.content for m in res.messages if isinstance(m, HumanMessage))
+    # the XML-ish form is recognised too
+    res = make_agent([as_tag, call("search_catalog"), AIMessage(content="done")], reg)[0].run("t")
+    assert res.format_errors == 1
+
+
+def test_text_tool_call_nudges_are_limited(world):
+    reg, _ = world
+    txt = AIMessage(content='{"name": "search_catalog", "parameters": {}}')
+    res = make_agent([txt, txt, txt, AIMessage(content="x")], reg)[0].run("t")
+    assert res.format_errors == 2 and res.stop_reason == "final_answer"   # eventually accepted
+
+
+def test_normal_json_answer_is_not_mistaken_for_a_tool_call(world):
+    reg, _ = world
+    script = [call("search_catalog"), AIMessage(content='{"dataset": "med", "name": "sst"}')]
+    assert make_agent(script, reg)[0].run("t").format_errors == 0
+
+
+def test_answering_from_memory_is_challenged_once(world):
+    reg, _ = world
+    script = [AIMessage(content="The best dataset is ERA5."),        # hallucinated, no tools
+              call("search_catalog", query="sst"),
+              AIMessage(content="Found med.")]
+    res = make_agent(script, reg)[0].run("t")
+    assert res.answer == "Found med." and len(res.tool_calls) == 1
+    # if the model insists, the second no-tool answer is accepted (no endless loop)
+    res = make_agent([AIMessage(content="ERA5."), AIMessage(content="ERA5.")], reg)[0].run("t")
+    assert res.ok and res.answer == "ERA5." and res.tool_calls == []
+
+
+def test_wrapup_survives_a_backend_that_ignores_tool_choice(world):
+    """ChatOllama ignores tool_choice='none': the wrap-up may still come back as a tool call."""
+    reg, _ = world
+    script = [call("search_catalog", query="q0"), call("search_catalog", query="q1"),
+              call("search_catalog", query="still going"),       # wrap-up attempt 1: rejected
+              AIMessage(content="Summary of what I did.")]       # attempt 2: accepted
+    res = make_agent(script, reg, max_steps=2)[0].run("t")
+    assert res.stop_reason == "max_steps" and res.answer == "Summary of what I did."
+
+
+def test_wrapup_failure_is_reported(world):
+    reg, _ = world
+    script = [call("search_catalog", query="q0"), RuntimeError("boom"), RuntimeError("boom")]
+    res = make_agent(script, reg, max_steps=1)[0].run("t")
+    assert res.stop_reason == "max_steps" and res.answer == "" and "boom" in res.error
+
+
+def test_baseline_prompt_fits_a_small_context_window(world):
+    reg, _ = world
+    chars = len(SYSTEM_PROMPT) + len(json.dumps(reg.ollama_tools()))
+    assert chars / 4 < 3500, "system prompt + tool schemas should stay well under num_ctx"
+
+
+# ------------------------------------------------------------ Ollama factory
+def clean_env(monkeypatch, *names):
+    monkeypatch.setattr("dotenv.load_dotenv", lambda *a, **k: False)  # ignore the real .env
+    for n in names:
+        monkeypatch.delenv(n, raising=False)
+
+
+def test_make_ollama_llm_defaults_and_env(monkeypatch):
+    clean_env(monkeypatch, "OLLAMA_MODEL", "OLLAMA_NUM_CTX", "OLLAMA_HOST", "OLLAMA_KEEP_ALIVE")
+    llm = make_ollama_llm()                       # no server needed to construct
+    assert llm.model == DEFAULT_OLLAMA_MODEL and llm.num_ctx == 16384 and llm.temperature == 0.0
+    assert llm.keep_alive == "30m"
+    monkeypatch.setenv("OLLAMA_MODEL", "qwen3:8b")
+    monkeypatch.setenv("OLLAMA_NUM_CTX", "8192")
+    monkeypatch.setenv("OLLAMA_HOST", "http://gpu-box:11434")
+    llm = make_ollama_llm()
+    assert (llm.model, llm.num_ctx, llm.base_url) == ("qwen3:8b", 8192, "http://gpu-box:11434")
+    assert make_ollama_llm(model="llama3.2:3b", num_ctx=4096).num_ctx == 4096
+
+
+def test_ollama_model_accepts_the_tool_schemas(monkeypatch):
+    clean_env(monkeypatch, "OLLAMA_MODEL", "OLLAMA_HOST")
+    from agent_tools import ToolContext, build_registry
+    from catalog_adapters import InMemoryCatalog
+    import tempfile
+    reg = build_registry(ToolContext(InMemoryCatalog([]), tempfile.mkdtemp()))
+    bound = make_ollama_llm().bind_tools(reg.ollama_tools())        # must not raise
+    assert len(bound.kwargs["tools"]) == len(reg.names)
+
+
+def test_make_llm_selects_backend(monkeypatch):
+    clean_env(monkeypatch, "LLM_BACKEND", "OLLAMA_MODEL", "GROQ_MODEL", "GROQ_REASONING_EFFORT")
+    monkeypatch.setenv("GROQ_API_KEY", "test-key")
+    assert type(make_llm()).__name__ == "ChatOllama"                # local by default
+    assert type(make_llm("groq")).__name__ == "ChatGroq"
+    monkeypatch.setenv("LLM_BACKEND", "groq")
+    assert type(make_llm()).__name__ == "ChatGroq"
+    assert model_name(make_llm("ollama", model="qwen3:8b")) == "qwen3:8b"
+    with pytest.raises(ValueError, match="Unknown LLM backend"):
+        make_llm("nope")
+
+
+def test_ollama_wire_format_against_a_fake_server(world):
+    """The real ChatOllama client talking to a minimal fake Ollama HTTP server."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    reg, _ = world
+    requests = []
+    replies = [
+        {"message": {"role": "assistant", "content": "", "tool_calls": [
+            {"function": {"name": "search_catalog",
+                          "arguments": {"query": "sea surface temperature"}}}]}},
+        {"message": {"role": "assistant", "content": "Found dataset med. Anything else?"}},
+    ]
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            requests.append(body)
+            out = {"model": body.get("model"), "created_at": "2026-01-01T00:00:00Z",
+                   "done": True, "done_reason": "stop", "prompt_eval_count": 100,
+                   "eval_count": 20, **replies[len(requests) - 1]}
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson")
+            self.end_headers()
+            self.wfile.write((json.dumps(out) + "\n").encode())
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        llm = make_ollama_llm(model="llama3.1:8b", num_ctx=12000,
+                              base_url=f"http://127.0.0.1:{server.server_port}")
+        res = GeoMetaAgent(llm, reg).run("sea surface temperature please")
+    finally:
+        server.shutdown()
+
+    assert res.ok and res.steps == 2 and [c["name"] for c in res.tool_calls] == ["search_catalog"]
+    assert res.usage == {"input_tokens": 200, "output_tokens": 40}
+    first, second = requests
+    assert first["options"]["num_ctx"] == 12000          # the context window reaches the server
+    assert len(first["tools"]) == len(reg.names)
+    assert [m["role"] for m in second["messages"]] == ["system", "user", "assistant", "tool"]
+    assert json.loads(second["messages"][-1]["content"])["n_results"] == 1
 
 
 # ------------------------------------------------------------ Groq factory

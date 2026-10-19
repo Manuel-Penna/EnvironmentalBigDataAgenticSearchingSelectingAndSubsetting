@@ -2,10 +2,12 @@
 Run the GeoMeta agent from the command line.
 
     python run_agent.py "Monthly sea surface temperature for the Mediterranean, 2010-2020"
-    python run_agent.py "..." --max-mb 200 --max-steps 12 --model openai/gpt-oss-120b
+    python run_agent.py "..." --backend ollama --model qwen3:8b --num-ctx 16384
+    python run_agent.py "..." --backend groq --model openai/gpt-oss-120b
 
-Needs: Qdrant running with an ingested catalog, Ollama serving nomic-embed-text,
-and GROQ_API_KEY in a .env file (see .env.example).
+Needs: Qdrant running with an ingested catalog and Ollama serving nomic-embed-text.
+Backend "ollama" (default) also needs a tool-calling model pulled, e.g.
+`ollama pull llama3.1:8b`. Backend "groq" needs GROQ_API_KEY in .env (see .env.example).
 
 Every run is saved to runs/<timestamp>.json (task, model, answer, tool calls,
 full message trace, token usage): this is the raw material for the evaluation.
@@ -20,7 +22,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from agent import GeoMetaAgent, make_groq_llm
+from agent import GeoMetaAgent, make_llm, model_name
 from agent_tools import ToolContext, build_registry
 
 
@@ -55,7 +57,13 @@ def main() -> int:
     ap.add_argument("--max-mb", type=float, default=500, help="subset size limit (MB)")
     ap.add_argument("--out", default="subsets", help="folder for extracted subsets")
     ap.add_argument("--runs-dir", default="runs", help="folder for run records")
-    ap.add_argument("--model", default=None, help="override GROQ_MODEL")
+    ap.add_argument("--backend", choices=["ollama", "groq"], default=None,
+                    help="LLM backend (default: LLM_BACKEND env var, else ollama)")
+    ap.add_argument("--model", default=None, help="override OLLAMA_MODEL / GROQ_MODEL")
+    ap.add_argument("--num-ctx", type=int, default=None,
+                    help="Ollama context window in tokens (default 16384)")
+    ap.add_argument("--max-result-chars", type=int, default=6000,
+                    help="cap on each tool result shown to the model (lower for small contexts)")
     ap.add_argument("--quiet", action="store_true", help="do not print the step trace")
     args = ap.parse_args()
 
@@ -64,8 +72,10 @@ def main() -> int:
     ctx = ToolContext(catalog=build_catalog(), output_dir=out,
                       default_max_bytes=int(args.max_mb * 1_000_000),
                       provenance_path=out / "provenance.jsonl")
-    llm = make_groq_llm(model=args.model)
+    extra = {"num_ctx": args.num_ctx} if args.num_ctx and args.backend != "groq" else {}
+    llm = make_llm(backend=args.backend, model=args.model, **extra)
     agent = GeoMetaAgent(llm, build_registry(ctx), max_steps=args.max_steps,
+                         max_result_chars=args.max_result_chars,
                          on_event=None if args.quiet else print_event)
 
     result = agent.run(args.task)
@@ -73,7 +83,8 @@ def main() -> int:
     print("\n" + (result.answer or "(no answer)"))
     print(f"\n[{result.stop_reason}] {result.steps} steps, {len(result.tool_calls)} tool calls, "
           f"{result.elapsed_s:.1f}s, tokens in/out "
-          f"{result.usage['input_tokens']}/{result.usage['output_tokens']}", file=sys.stderr)
+          f"{result.usage['input_tokens']}/{result.usage['output_tokens']}, "
+          f"format errors {result.format_errors}", file=sys.stderr)
     if result.error:
         print(f"error: {result.error}", file=sys.stderr)
 
@@ -81,7 +92,8 @@ def main() -> int:
     runs.mkdir(parents=True, exist_ok=True)
     path = runs / f"{datetime.now():%Y%m%d_%H%M%S}.json"
     path.write_text(json.dumps({
-        "task": args.task, "model": getattr(llm, "model_name", None),
+        "task": args.task, "backend": args.backend or os.getenv("LLM_BACKEND", "ollama"),
+        "model": model_name(llm),
         "max_mb": args.max_mb, "max_steps": args.max_steps,
         "result": result.to_dict(), "provenance": ctx.log,
     }, indent=2, default=str), encoding="utf-8")

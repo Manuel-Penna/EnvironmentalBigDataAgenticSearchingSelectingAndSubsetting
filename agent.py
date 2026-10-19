@@ -37,6 +37,7 @@ from langchain_core.messages import (AIMessage, BaseMessage, HumanMessage,
 from agent_tools import ToolRegistry, to_text
 
 DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b"
+DEFAULT_OLLAMA_MODEL = "llama3.1:8b"
 
 SYSTEM_PROMPT = """You are the GeoMeta agent. You help users find environmental datasets in a catalog of NetCDF and Zarr files and extract exactly the subset they need. Today is {today}.
 
@@ -57,6 +58,10 @@ Rules:
 
 MALFORMED_NUDGE = ("Your last tool call was malformed and was not executed. Call the tool "
                    "again with valid JSON arguments that match its schema.")
+TEXT_CALL_NUDGE = ("That tool call was written as plain text, so it was NOT executed. Use the "
+                   "tool-calling interface to call the tool.")
+NO_TOOL_NUDGE = ("You answered without using any tool. Do not answer from memory: search the "
+                 "catalog first, or ask one short clarifying question if the request is unclear.")
 REPEAT_NOTE = ("You already made this exact call and the result will not change. Choose a "
                "different action or give your final answer.")
 WRAPUP_PROMPT = ("The step limit has been reached. Without calling any tool, summarise what "
@@ -98,6 +103,7 @@ class AgentResult:
     elapsed_s: float
     messages: list[BaseMessage] = field(repr=False, default_factory=list)
     error: str | None = None
+    format_errors: int = 0              # malformed / text-form tool calls the model produced
 
     @property
     def ok(self) -> bool:
@@ -107,6 +113,7 @@ class AgentResult:
         return {"answer": self.answer, "stop_reason": self.stop_reason, "steps": self.steps,
                 "tool_calls": self.tool_calls, "subsets": self.subsets, "usage": self.usage,
                 "elapsed_s": round(self.elapsed_s, 2), "error": self.error,
+                "format_errors": self.format_errors,
                 "trace": messages_to_dicts(self.messages)}
 
 
@@ -139,24 +146,30 @@ class GeoMetaAgent:
         seen: dict[str, int] = {}
         created: list[str] = []
         verified: dict[str, bool] = {}
-        malformed = unverified_nudges = 0
+        format_errors = unverified_nudges = no_tool_nudges = 0
+        tool_names = set(self.registry.names)
         step = 0
 
         def finish(reason: str, answer: str = "", error: str | None = None) -> AgentResult:
             return AgentResult(
                 answer=answer, stop_reason=reason, steps=step, tool_calls=calls,
                 subsets=[{"subset_id": s, "verified": verified.get(s)} for s in created],
-                usage=usage, elapsed_s=time.perf_counter() - t0, messages=messages, error=error)
+                usage=usage, elapsed_s=time.perf_counter() - t0, messages=messages,
+                error=error, format_errors=format_errors)
+
+        def bounce(nudge: str, kind: str) -> None:
+            nonlocal format_errors
+            format_errors += 1
+            messages.append(HumanMessage(nudge))
+            self.on_event({"type": kind, "step": step})
 
         for step in range(1, self.max_steps + 1):
             # ---- ask the model ------------------------------------------------
             try:
                 ai: AIMessage = llm.invoke(messages)
             except Exception as e:  # noqa: BLE001
-                if _is_malformed_tool_call(e) and malformed < 2:
-                    malformed += 1
-                    messages.append(HumanMessage(MALFORMED_NUDGE))
-                    self.on_event({"type": "malformed_tool_call", "step": step})
+                if _is_malformed_tool_call(e) and format_errors < 2:
+                    bounce(MALFORMED_NUDGE, "malformed_tool_call")
                     continue
                 return finish("llm_error", error=f"{type(e).__name__}: {e}")
 
@@ -164,15 +177,22 @@ class GeoMetaAgent:
             usage["input_tokens"] += um.get("input_tokens", 0)
             usage["output_tokens"] += um.get("output_tokens", 0)
             messages.append(ai)
-            if _text(ai.content).strip() and ai.tool_calls:
-                self.on_event({"type": "thought", "step": step, "text": _text(ai.content)})
+            text = _text(ai.content)
+            if text.strip() and ai.tool_calls:
+                self.on_event({"type": "thought", "step": step, "text": text})
 
-            # ---- no tool call: a final answer (if the rules allow it) ----------
+            # ---- no tool call: a final answer, if the rules allow it ---------
             if not ai.tool_calls:
-                if getattr(ai, "invalid_tool_calls", None) and malformed < 2:
-                    malformed += 1
-                    messages.append(HumanMessage(MALFORMED_NUDGE))
-                    self.on_event({"type": "malformed_tool_call", "step": step})
+                if getattr(ai, "invalid_tool_calls", None) and format_errors < 2:
+                    bounce(MALFORMED_NUDGE, "malformed_tool_call")
+                    continue
+                if _looks_like_text_tool_call(text, tool_names) and format_errors < 2:
+                    bounce(TEXT_CALL_NUDGE, "text_tool_call")
+                    continue
+                if not calls and not text.rstrip().endswith("?") and no_tool_nudges < 1:
+                    no_tool_nudges += 1                      # answering from memory
+                    messages.append(HumanMessage(NO_TOOL_NUDGE))
+                    self.on_event({"type": "no_tool_nudge", "step": step})
                     continue
                 pending = [s for s in created if s not in verified]
                 if pending and unverified_nudges < 2:
@@ -182,7 +202,7 @@ class GeoMetaAgent:
                         "Verify it before giving your answer."))
                     self.on_event({"type": "verify_nudge", "step": step, "subsets": pending})
                     continue
-                return finish("final_answer", answer=_text(ai.content))
+                return finish("final_answer", answer=text)
 
             # ---- execute the tool calls ------------------------------------
             for i, tc in enumerate(ai.tool_calls):
@@ -207,14 +227,42 @@ class GeoMetaAgent:
                                             tool_call_id=call_id, name=name))
 
         # ---- step limit: ask for a summary instead of returning nothing -------
+        answer, error = self._wrap_up(messages, tools)
+        return finish("max_steps", answer=answer, error=error)
+
+    def _wrap_up(self, messages: list[BaseMessage], tools: list[dict]) -> tuple[str, str | None]:
+        """Force a plain-text summary. tool_choice="none" is honoured by Groq but
+        silently ignored by ChatOllama, so a reply that still contains tool calls (or
+        no text) is discarded and the model is asked again with no tools bound."""
         messages.append(HumanMessage(WRAPUP_PROMPT))
-        try:
-            ai = self.llm.bind_tools(tools, tool_choice="none").invoke(messages)
-            messages.append(ai)
-            answer = _text(ai.content)
-        except Exception as e:  # noqa: BLE001
-            return finish("max_steps", error=f"wrap-up failed: {type(e).__name__}: {e}")
-        return finish("max_steps", answer=answer)
+        last_error = "wrap-up produced no text"
+        for model in (self.llm.bind_tools(tools, tool_choice="none"), self.llm):
+            try:
+                ai = model.invoke(messages)
+            except Exception as e:  # noqa: BLE001
+                last_error = f"wrap-up failed: {type(e).__name__}: {e}"
+                continue
+            if not ai.tool_calls and _text(ai.content).strip():
+                messages.append(ai)
+                return _text(ai.content), None
+        return "", last_error
+
+
+def _looks_like_text_tool_call(text: str, tool_names: set[str]) -> bool:
+    """Small local models often print the call instead of using the tool channel."""
+    if "<tool_call>" in text or "<function=" in text:
+        return True
+    s = text.strip()
+    if s.startswith("```"):
+        s = s.strip("`").removeprefix("json").strip()
+    if not s.startswith("{"):
+        return False
+    try:
+        obj = json.loads(s)
+    except ValueError:
+        return False
+    return (isinstance(obj, dict) and obj.get("name") in tool_names
+            and any(k in obj for k in ("parameters", "arguments", "args")))
 
 
 def _is_malformed_tool_call(e: Exception) -> bool:
@@ -244,3 +292,42 @@ def make_groq_llm(model: str | None = None, temperature: float = 0.0, **kwargs: 
         kwargs["reasoning_effort"] = os.environ["GROQ_REASONING_EFFORT"]
     return ChatGroq(model=model or os.getenv("GROQ_MODEL", DEFAULT_GROQ_MODEL),
                     temperature=temperature, max_retries=3, **kwargs)
+
+
+def make_ollama_llm(model: str | None = None, temperature: float = 0.0,
+                    num_ctx: int | None = None, **kwargs: Any):
+    """ChatOllama configured from the environment (.env is loaded automatically).
+
+    OLLAMA_MODEL       model tag (default: llama3.1:8b). Must support tool calling.
+    OLLAMA_HOST        server URL (default: http://localhost:11434)
+    OLLAMA_NUM_CTX     context window in tokens (default: 16384). IMPORTANT: Ollama's own
+                       default is small, and a prompt that does not fit is silently
+                       truncated, which makes the model lose its instructions and tools.
+    OLLAMA_KEEP_ALIVE  how long the model stays loaded between calls (default: 30m)
+    """
+    from dotenv import load_dotenv
+    load_dotenv()
+    from langchain_ollama import ChatOllama
+
+    if os.getenv("OLLAMA_HOST") and "base_url" not in kwargs:
+        kwargs["base_url"] = os.environ["OLLAMA_HOST"]
+    return ChatOllama(model=model or os.getenv("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL),
+                      temperature=temperature,
+                      num_ctx=num_ctx or int(os.getenv("OLLAMA_NUM_CTX", "16384")),
+                      keep_alive=os.getenv("OLLAMA_KEEP_ALIVE", "30m"), **kwargs)
+
+
+def make_llm(backend: str | None = None, model: str | None = None, **kwargs: Any):
+    """Pick the backend: LLM_BACKEND env var or argument ("ollama" | "groq")."""
+    from dotenv import load_dotenv
+    load_dotenv()
+    backend = (backend or os.getenv("LLM_BACKEND", "ollama")).lower()
+    if backend == "ollama":
+        return make_ollama_llm(model=model, **kwargs)
+    if backend == "groq":
+        return make_groq_llm(model=model, **kwargs)
+    raise ValueError(f"Unknown LLM backend '{backend}' (use 'ollama' or 'groq').")
+
+
+def model_name(llm: Any) -> str | None:
+    return getattr(llm, "model_name", None) or getattr(llm, "model", None)
