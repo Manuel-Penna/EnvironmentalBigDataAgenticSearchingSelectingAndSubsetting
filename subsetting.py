@@ -228,6 +228,22 @@ def _as_indexer(idx: np.ndarray):
     return idx
 
 
+def _bound_timestamp(value: str | None, end: bool) -> "pd.Timestamp | None":
+    """A request bound as a Timestamp; a date-only END means the end of that day."""
+    if value is None:
+        return None
+    s = _clean_time(value)
+    if "T" in s or " " in s:
+        return pd.Timestamp(s)
+    p = pd.Period(s)
+    return p.end_time if end else p.start_time
+
+
+def _median_step(values: np.ndarray) -> float:
+    d = np.abs(np.diff(np.sort(np.asarray(values, dtype=float))))
+    return float(np.median(d)) if d.size else 0.0
+
+
 def plan_subset(ds: xr.Dataset, request: "SubsetRequest | dict") -> SubsetPlan:
     req = _coerce_request(request)
     warnings: list[str] = []
@@ -286,6 +302,27 @@ def plan_subset(ds: xr.Dataset, request: "SubsetRequest | dict") -> SubsetPlan:
                     available=[str(index[0]), str(index[-1])])
             selections[tdim] = idx
 
+            # partial coverage: the request reaches further than the data does. The gap
+            # must exceed the typical time step, so monthly data stamped mid-month does
+            # not warn for a request ending on the last day of that month.
+            if isinstance(index, pd.DatetimeIndex) and len(index) > 1 and index.tz is None:
+                try:
+                    step = pd.Series(index).diff().median()
+                    r_start, r_end = _bound_timestamp(start, False), _bound_timestamp(end, True)
+                    notes = []
+                    if r_end is not None and r_end - index[-1] > step:
+                        notes.append(f"the dataset ends {index[-1].date()} but the request "
+                                     f"runs to {r_end.date()}")
+                    if r_start is not None and index[0] - r_start > step:
+                        notes.append(f"the dataset starts {index[0].date()} but the request "
+                                     f"starts {r_start.date()}")
+                    if notes:
+                        warnings.append("Requested period is only partly covered: "
+                                        + "; ".join(notes) + ". The subset contains only the "
+                                        "overlapping part.")
+                except Exception:  # noqa: BLE001  (a coverage hint must never break a subset)
+                    pass
+
     # ---- space ----------------------------------------------------------
     if req.bbox:
         lat_min, lat_max, lon_min, lon_max = req.bbox
@@ -312,6 +349,13 @@ def plan_subset(ds: xr.Dataset, request: "SubsetRequest | dict") -> SubsetPlan:
                     axis="lat", requested=[lat_min, lat_max],
                     available=[float(np.nanmin(lat_vals)), float(np.nanmax(lat_vals))])
             selections[lat_dim] = idx
+            lat_step = _median_step(lat_vals)
+            if lat_vals.size > 1 and (lat_min < np.nanmin(lat_vals) - lat_step
+                                      or lat_max > np.nanmax(lat_vals) + lat_step):
+                warnings.append(
+                    f"Requested latitudes [{lat_min}, {lat_max}] are only partly covered: the "
+                    f"dataset spans [{float(np.nanmin(lat_vals))}, {float(np.nanmax(lat_vals))}]. "
+                    "Only the overlapping part is returned.")
 
         span = lon_max - lon_min
         if span < 0:
@@ -331,6 +375,13 @@ def plan_subset(ds: xr.Dataset, request: "SubsetRequest | dict") -> SubsetPlan:
             idx = idx[np.argsort(key[idx], kind="stable")]  # west -> east
             selections[lon_dim] = idx
             lon_origin = lon_min
+            lon_step = _median_step(lon_vals)
+            if lon_vals.size > 1 and span - (key[idx].max() - key[idx].min() + lon_step) > 2 * lon_step:
+                got = float(key[idx].max() - key[idx].min() + lon_step)
+                warnings.append(
+                    f"Requested longitudes ({lon_min}..{lon_max}) are only partly covered: the "
+                    f"dataset provides about {got:.0f} of the {span:.0f} degrees requested. "
+                    "Only the overlapping part is returned.")
 
     # ---- stride ---------------------------------------------------------
     for key_name, step in req.stride.items():
@@ -451,6 +502,25 @@ def estimate_subset_size(source: "str | Path | xr.Dataset",
 # --------------------------------------------------------------------------
 # Subsetting
 # --------------------------------------------------------------------------
+def _extent(ds: xr.Dataset, axes: dict[str, str]) -> dict:
+    """What the subset actually spans (first/last time, lat and lon ranges), read from the
+    coordinates only. Longitudes are in the request's convention."""
+    out: dict[str, list] = {}
+    for kind in ("time", "lat", "lon"):
+        name = axes.get(kind)
+        if not name or name not in ds.variables or ds[name].size == 0:
+            continue
+        vals = ds[name].values
+        if kind == "time":
+            fmt = (lambda v: np.datetime_as_string(v, unit="s")
+                   if isinstance(v, np.datetime64) else str(v))
+            out["time"] = [fmt(vals.min()), fmt(vals.max())]
+        else:
+            v = np.asarray(vals, dtype=float)
+            out[kind] = [float(np.nanmin(v)), float(np.nanmax(v))]
+    return out
+
+
 def _infer_format(path: Path) -> str:
     return "netcdf" if path.suffix.lower() in {".nc", ".nc4", ".netcdf"} else "zarr"
 
@@ -537,6 +607,7 @@ def subset_dataset(source: "str | Path | xr.Dataset",
             "output_path": str(out_path),
             "format": fmt,
             "shape": est["shape"],
+            "extent": _extent(plan.dataset, plan.axes),
             "variables": list(plan.dataset.data_vars),
             "estimated_output_bytes": est["output_bytes"],
             "bytes_read": est["bytes_read"],

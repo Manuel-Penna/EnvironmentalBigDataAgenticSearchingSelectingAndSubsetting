@@ -25,6 +25,7 @@ Design
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import time
@@ -110,6 +111,16 @@ class AgentResult:
     messages: list[BaseMessage] = field(repr=False, default_factory=list)
     error: str | None = None
     format_errors: int = 0              # malformed / text-form tool calls the model produced
+    llm_calls: list[dict] = field(default_factory=list)   # {"step","seconds","input_tokens","output_tokens","retries","retry_wait_seconds"}
+
+    @property
+    def llm_seconds(self) -> float:
+        return sum(c["seconds"] for c in self.llm_calls)
+
+    @property
+    def retry_wait_seconds(self) -> float:
+        """Time the SDK spent waiting to retry (rate limits / server errors), inside llm_seconds."""
+        return sum(c.get("retry_wait_seconds", 0) for c in self.llm_calls)
 
     @property
     def ok(self) -> bool:
@@ -129,8 +140,41 @@ class AgentResult:
                 "outcome": self.outcome, "steps": self.steps,
                 "tool_calls": self.tool_calls, "subsets": self.subsets, "usage": self.usage,
                 "elapsed_s": round(self.elapsed_s, 2), "error": self.error,
-                "format_errors": self.format_errors,
+                "format_errors": self.format_errors, "llm_calls": self.llm_calls,
+                "llm_seconds": round(self.llm_seconds, 2),
+                "retry_wait_seconds": round(self.retry_wait_seconds, 2),
                 "trace": messages_to_dicts(self.messages)}
+
+
+# --------------------------------------------------------------------------
+# Retry attribution
+# --------------------------------------------------------------------------
+class _RetryWatcher(logging.Handler):
+    """Collects the "Retrying request to ... in N seconds" lines that the Groq SDK logs
+    (at INFO) when it waits on a rate limit or a server error, so a slow model call can be
+    attributed to waiting instead of guessed at."""
+
+    SDK_LOGGER = "groq._base_client"
+
+    def __init__(self) -> None:
+        super().__init__(logging.INFO)
+        self.waits: list[float] = []
+        self._logger = logging.getLogger(self.SDK_LOGGER)
+        self._old_level = self._logger.level
+
+    def attach(self) -> None:
+        self._logger.addHandler(self)
+        if self._logger.getEffectiveLevel() > logging.INFO:
+            self._logger.setLevel(logging.INFO)
+
+    def detach(self) -> None:
+        self._logger.removeHandler(self)
+        self._logger.setLevel(self._old_level)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        m = re.search(r"Retrying request to .* in ([\d.]+) seconds", record.getMessage())
+        if m:
+            self.waits.append(float(m.group(1)))
 
 
 # --------------------------------------------------------------------------
@@ -148,6 +192,14 @@ class GeoMetaAgent:
         self.on_event = on_event or (lambda e: None)
 
     def run(self, task: str) -> AgentResult:
+        watcher = _RetryWatcher()
+        watcher.attach()
+        try:
+            return self._run(task, watcher)
+        finally:
+            watcher.detach()
+
+    def _run(self, task: str, watcher: _RetryWatcher) -> AgentResult:
         t0 = time.perf_counter()
         today = (self.registry.ctx.today or date.today()).isoformat()
         messages: list[BaseMessage] = [
@@ -163,6 +215,7 @@ class GeoMetaAgent:
         created: list[str] = []
         verified: dict[str, bool] = {}
         details: dict[str, dict] = {}
+        llm_calls: list[dict] = []
         format_errors = unverified_nudges = no_tool_nudges = extract_nudges = 0
         estimated_ok = False
         tool_names = set(self.registry.names)
@@ -174,7 +227,7 @@ class GeoMetaAgent:
                 subsets=[{"subset_id": s, "verified": verified.get(s), **details.get(s, {})}
                          for s in created],
                 usage=usage, elapsed_s=time.perf_counter() - t0, messages=messages,
-                error=error, format_errors=format_errors)
+                error=error, format_errors=format_errors, llm_calls=llm_calls)
 
         def bounce(nudge: str, kind: str) -> None:
             nonlocal format_errors
@@ -184,6 +237,8 @@ class GeoMetaAgent:
 
         for step in range(1, self.max_steps + 1):
             # ---- ask the model ------------------------------------------------
+            t_call = time.perf_counter()
+            waits_before = len(watcher.waits)
             try:
                 ai: AIMessage = llm.invoke(messages)
             except Exception as e:  # noqa: BLE001
@@ -195,6 +250,11 @@ class GeoMetaAgent:
             um = getattr(ai, "usage_metadata", None) or {}
             usage["input_tokens"] += um.get("input_tokens", 0)
             usage["output_tokens"] += um.get("output_tokens", 0)
+            waited = watcher.waits[waits_before:]
+            llm_calls.append({"step": step, "seconds": round(time.perf_counter() - t_call, 2),
+                              "input_tokens": um.get("input_tokens", 0),
+                              "output_tokens": um.get("output_tokens", 0),
+                              "retries": len(waited), "retry_wait_seconds": round(sum(waited), 2)})
             messages.append(ai)
             text = _text(ai.content)
             if text.strip() and ai.tool_calls:
@@ -244,7 +304,8 @@ class GeoMetaAgent:
                     created.append(result["subset_id"])
                     details[result["subset_id"]] = {   # facts from the tool, not the model
                         "output_path": result.get("output_path"), "shape": result.get("shape"),
-                        "output_bytes": result.get("output_bytes"), "arguments": args}
+                        "output_bytes": result.get("output_bytes"), "arguments": args,
+                        "extent": result.get("extent"), "warnings": result.get("warnings", [])}
                 if name == "verify_subset" and result.get("ok"):
                     verified[result["subset_id"]] = bool(result["verified"])
 

@@ -326,3 +326,34 @@ def test_rule_can_be_switched_off(env):
     reg, ctx, *_ = env              # fixture runs with require_estimate=False
     assert ctx.require_estimate is False
     assert reg.call("subset_dataset", {**EST_ARGS, "variables": ["sst"]})["ok"]
+
+
+def test_include_attributes_returns_only_the_informative_ones(env):
+    reg, _, catalog, _ = env
+    rec = catalog.get("med")
+    rec["global_attributes"].update({
+        "institution": "Met Office", "license": "L" * 500, "creator_email": "x@y.z",
+        "geospatial_lat_min": 30, "keywords": "a, b, c", "Conventions": "CF-1.6",
+        "infoUrl": "http://example.org"})
+    attrs = reg.call("get_dataset", {"dataset_id": "med", "include_attributes": True})["global_attributes"]
+    assert set(attrs) == {"title", "summary", "institution", "license", "Conventions"}
+    assert attrs["license"].endswith("...") and len(attrs["license"]) < 210
+
+
+def test_estimate_points_to_the_next_step_only_when_it_fits(env):
+    """Real Groq runs often stopped after the estimate and wrote an invented final answer;
+    subset_dataset's next_step is followed reliably, so the estimate gets one too."""
+    reg, *_ = env
+    fits = reg.call("estimate_subset_size", EST_ARGS)
+    assert "Nothing has been extracted yet" in fits["next_step"] and "subset_dataset" in fits["next_step"]
+    too_big = reg.call("estimate_subset_size", {**EST_ARGS, "max_bytes": 100})
+    assert "next_step" not in too_big and too_big["hints"]
+
+
+def test_subset_result_and_sidecar_carry_the_extent(env):
+    reg, _, _, tmp = env
+    r = reg.call("subset_dataset", {**EST_ARGS, "variables": ["sst"]})
+    assert r["extent"]["time"] == ["2000-03-01T00:00:00", "2000-03-31T00:00:00"]
+    assert r["extent"]["lat"] == [35.0, 40.0]
+    side = json.loads((tmp / "subsets" / f"{r['subset_id']}.provenance.json").read_text())
+    assert side["extent"] == r["extent"]

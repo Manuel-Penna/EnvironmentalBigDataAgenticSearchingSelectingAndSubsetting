@@ -228,3 +228,90 @@ def test_verify_detects_all_nan_units_and_range(tmp_path):
 def test_verify_flags_empty_dimension():
     ds = make_ds([0, 1], [0, 1], DAILY[:3]).isel(lat=slice(0, 0))
     assert not verify_subset(ds)["ok"]
+
+
+# -------------------------------------------------------- coverage warnings
+def warns(ds, req):
+    est = estimate_subset_size(ds, req)
+    assert est["ok"], est
+    return [w for w in est["warnings"] if "partly covered" in w]
+
+
+def test_period_running_past_the_end_of_the_data_warns():
+    """Real run: HadISST ends 2026-06-16, the request was the whole of 2026."""
+    ds = make_ds([0, 1], [0, 1], DAILY)                     # 2000-01-01 .. 2001-12-31
+    w = warns(ds, {"time": ("2001-06-01", "2002-06-30")})
+    assert len(w) == 1 and "ends 2001-12-31" in w[0] and "2002-06-30" in w[0]
+
+
+def test_period_starting_before_the_data_warns():
+    ds = make_ds([0, 1], [0, 1], DAILY)
+    w = warns(ds, {"time": ("1999-06-01", "2000-06-30")})
+    assert len(w) == 1 and "starts 2000-01-01" in w[0]
+
+
+def test_period_inside_the_data_does_not_warn():
+    ds = make_ds([0, 1], [0, 1], DAILY)
+    assert warns(ds, {"time": ("2000-03-01", "2001-03-31")}) == []
+    assert warns(ds, {"time": ("2000-01-01", "2001-12-31")}) == []        # exactly the data
+
+
+def test_monthly_data_stamped_mid_month_does_not_warn_for_the_last_month():
+    time = pd.date_range("2000-01-01", periods=12, freq="MS") + pd.Timedelta(days=15)   # 16th
+    ds = make_ds([0, 1], [0, 1], time)
+    assert warns(ds, {"time": ("2000-01-01", "2000-12-31")}) == []        # gap < one step
+    assert len(warns(ds, {"time": ("2000-01-01", "2001-06-30")})) == 1
+
+
+def test_latitudes_beyond_the_dataset_warn_but_one_cell_of_slack_does_not():
+    ds = make_ds(np.arange(30, 46), np.arange(0, 10), DAILY[:3])
+    w = warns(ds, {"bbox": (20, 40, 0, 9)})
+    assert len(w) == 1 and "latitudes" in w[0] and "[30.0, 45.0]" in w[0]
+    assert warns(ds, {"bbox": (29.5, 45.5, 0, 9)}) == []
+
+
+def test_longitudes_only_partly_covered_warn():
+    ds = make_ds(np.arange(0, 5), np.arange(-6, 37), DAILY[:3])
+    w = warns(ds, {"bbox": (0, 4, -20, 10)})
+    assert len(w) == 1 and "longitudes" in w[0]
+    assert warns(ds, {"bbox": (0, 4, -6, 36)}) == []                      # exactly covered
+    assert warns(ds, {"bbox": (0, 4, 0, 10)}) == []
+
+
+def test_global_dataset_never_warns_for_a_regional_box():
+    ds = make_ds(np.arange(-90, 91, 2), np.arange(-180, 180, 2), DAILY[:3])
+    assert warns(ds, {"bbox": (30, 46, -6, 37)}) == []
+    assert warns(ds, {"bbox": (-10, 10, 170, -170)}) == []                 # antimeridian
+
+
+def test_coverage_warning_reaches_the_subset_result(tmp_path):
+    ds = make_ds([0, 1], [0, 1], DAILY)
+    res = subset_dataset(ds, {"time": ("2001-06-01", "2002-06-30")}, tmp_path / "o.zarr")
+    assert res["ok"] and any("partly covered" in w for w in res["warnings"])
+
+
+# ------------------------------------------------------------------- extent
+def test_result_reports_the_extent_actually_delivered(tmp_path):
+    ds = make_ds(np.arange(30, 46), np.arange(-6, 37), DAILY)
+    res = subset_dataset(ds, {"bbox": (35, 40, 0, 10), "time": ("2000-03-01", "2000-03-31")},
+                         tmp_path / "o.zarr")
+    assert res["extent"] == {"time": ["2000-03-01T00:00:00", "2000-03-31T00:00:00"],
+                             "lat": [35.0, 40.0], "lon": [0.0, 10.0]}
+
+
+def test_extent_longitudes_follow_the_request_convention(tmp_path):
+    ds = make_ds(np.arange(-90, 91, 2), np.arange(0, 360, 2), DAILY[:3])      # 0-360 dataset
+    res = subset_dataset(ds, {"bbox": (30, 46, -6, 36)}, tmp_path / "a.zarr")
+    assert res["extent"]["lon"] == [-6.0, 36.0]
+    ds = make_ds(np.arange(-20, 21, 2), np.arange(-180, 180, 2), DAILY[:3])
+    res = subset_dataset(ds, {"bbox": (-10, 10, 170, -170)}, tmp_path / "b.zarr")
+    assert res["extent"]["lon"] == [170.0, 190.0]                              # continuous
+
+
+def test_extent_exposes_clipping_to_the_available_period(tmp_path):
+    """A request for a whole year over data that ends in June delivers Jan-Jun, visibly."""
+    ds = make_ds([0, 1], [0, 1], DAILY)                                        # ends 2001-12-31
+    res = subset_dataset(ds, {"time": ("2001-01-01", "2001-12-31")}, tmp_path / "o.zarr")
+    assert res["extent"]["time"][1].startswith("2001-12-31")
+    res = subset_dataset(ds, {"time": ("2001-06-01", "2002-06-30")}, tmp_path / "p.zarr")
+    assert res["extent"]["time"] == ["2001-06-01T00:00:00", "2001-12-31T00:00:00"]

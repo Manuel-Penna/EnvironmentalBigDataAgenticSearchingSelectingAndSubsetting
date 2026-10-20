@@ -5,6 +5,7 @@ needed. This checks the LOOP (control flow, guards, logging), not how well a rea
 model chooses tools: that is what the evaluation set is for.
 """
 import json
+import logging
 
 import numpy as np
 import pytest
@@ -97,6 +98,7 @@ def test_full_workflow(world):
     assert sb["verified"] is True and sb["shape"] == {"time": 31, "lat": 6, "lon": 11}
     assert sb["output_path"].endswith(".zarr") and sb["output_bytes"] > 0
     assert sb["arguments"]["time"] == SUBSET_ARGS["time"]
+    assert sb["extent"]["time"] == ["2000-03-01T00:00:00", "2000-03-31T00:00:00"]   # what was delivered
     assert res.usage == {"input_tokens": 10, "output_tokens": 5}
     # conversation shape: system, user, then assistant/tool pairs
     assert isinstance(res.messages[0], SystemMessage) and isinstance(res.messages[1], HumanMessage)
@@ -331,6 +333,61 @@ def test_dropped_time_filter_is_caught_and_corrected(world):
     assert "time:" in refusal and "estimated" in refusal
     assert res.outcome == "delivered" and len(res.subsets) == 1
     assert res.subsets[0]["shape"]["time"] == 31                 # the corrected, estimated shape
+
+
+def test_llm_calls_are_timed_per_step(world):
+    reg, _ = world
+    u1 = {"input_tokens": 100, "output_tokens": 10, "total_tokens": 110}
+    u2 = {"input_tokens": 150, "output_tokens": 20, "total_tokens": 170}
+    first = call("search_catalog", query="sst")
+    first.usage_metadata = u1
+    script = [first, AIMessage(content="done", usage_metadata=u2)]
+    res = make_agent(script, reg)[0].run("t")
+    assert [(c["step"], c["input_tokens"], c["output_tokens"]) for c in res.llm_calls] == [
+        (1, 100, 10), (2, 150, 20)]
+    assert all(c["seconds"] >= 0 for c in res.llm_calls)
+    d = res.to_dict()
+    assert d["llm_calls"] == res.llm_calls and d["llm_seconds"] == round(res.llm_seconds, 2)
+
+
+def test_retry_waits_are_attributed_to_the_call_that_suffered_them(world):
+    reg, _ = world
+    sdk = logging.getLogger("groq._base_client")
+    level_before = sdk.level
+
+    def throttled(messages):          # what the Groq SDK logs while it waits on a 429
+        sdk.info("Retrying request to %s in %f seconds", "/openai/v1/chat/completions", 12.5)
+        sdk.info("Retrying request to %s in %f seconds", "/openai/v1/chat/completions", 20.0)
+        return AIMessage(content="Which variable do you want?")
+
+    res = make_agent([call("search_catalog"), throttled], reg)[0].run("t")
+    assert [(c["retries"], c["retry_wait_seconds"]) for c in res.llm_calls] == [(0, 0), (2, 32.5)]
+    assert res.retry_wait_seconds == 32.5 and res.to_dict()["retry_wait_seconds"] == 32.5
+    assert not any(type(h).__name__ == "_RetryWatcher" for h in sdk.handlers)   # cleaned up
+    assert sdk.level == level_before
+
+
+def test_retry_watcher_is_removed_even_if_the_run_crashes(world):
+    reg, _ = world
+    sdk = logging.getLogger("groq._base_client")
+
+    class Boom(ScriptedChat):
+        def bind_tools(self, *a, **k):
+            raise RuntimeError("bind failed")
+
+    with pytest.raises(RuntimeError):
+        GeoMetaAgent(Boom([]), reg).run("t")
+    assert not any(type(h).__name__ == "_RetryWatcher" for h in sdk.handlers)
+
+
+def test_subset_warnings_are_recorded_with_the_facts(world):
+    reg, _ = world
+    past_end = dict(SUBSET_ARGS, time={"start": "2001-06-01", "end": "2002-06-30"})
+    script = [call("estimate_subset_size", **past_end), call("subset_dataset", **past_end),
+              lambda m: call("verify_subset", subset_id=last_json(m)["subset_id"]),
+              AIMessage(content="done")]
+    res = make_agent(script, reg)[0].run("t")
+    assert any("partly covered" in w for w in res.subsets[0]["warnings"])
 
 
 def test_prompt_forbids_placeholders_and_unsupported_claims():

@@ -352,6 +352,11 @@ def _trim(x: Any, n: int = 300) -> Any:
     return x[:n] + "..." if isinstance(x, str) and len(x) > n else x
 
 
+_ATTR_KEYS = ("title", "summary", "description", "institution", "source", "references",
+              "license", "comment", "Conventions", "version", "product_version",
+              "processing_level")
+
+
 def _var_summary(v: dict) -> dict:
     a = v.get("attributes") or {}
     out: dict[str, Any] = {
@@ -466,8 +471,11 @@ def get_dataset(ctx: ToolContext, dataset_id: str, variables=None,
         "variables": [_var_summary(v) for v in chosen],
         "warnings": (rec.get("warnings") or [])[:5],
     }
-    if include_attributes:
-        out["global_attributes"] = {k: _trim(v, 200) for k, v in list(attrs.items())[:40]}
+    if include_attributes:   # the informative ones only; the rest costs tokens on every later call
+        by_lower = {k.lower(): k for k in attrs}
+        out["global_attributes"] = {
+            by_lower[k.lower()]: _trim(attrs[by_lower[k.lower()]], 200) for k in _ATTR_KEYS
+            if k.lower() in by_lower and attrs[by_lower[k.lower()]] not in (None, "")}
     if notes:
         out["notes"] = notes
     return {k: v for k, v in out.items() if v not in (None, [], {})} | {"ok": True}
@@ -494,6 +502,9 @@ def estimate_subset_size(ctx: ToolContext, dataset_id: str, variables: list,
         "max_bytes": limit, "within_limit": res["within_limit"],
         "warnings": res["warnings"],
     }
+    if res["within_limit"]:   # subset_dataset's own next_step is followed reliably; give the estimate one
+        out["next_step"] = ("Nothing has been extracted yet. To extract, call subset_dataset with "
+                            "exactly these arguments (variables, bbox, time, stride), then verify_subset.")
     hints = _size_hints(res, limit)
     if res["read_amplification"] and res["read_amplification"] > 20:
         hints.append("The source chunk layout makes this request read far more data than "
@@ -528,7 +539,7 @@ def subset_dataset(ctx: ToolContext, dataset_id: str, variables: list, bbox=None
         "subset_id": subset_id, "dataset_id": dataset_id, "source": rec["source"],
         "request": res["request"], "output_path": res["output_path"],
         "output_format": output_format, "shape": res["shape"],
-        "variables": res["variables"], "file_bytes": res["file_bytes"],
+        "variables": res["variables"], "file_bytes": res["file_bytes"], "extent": res["extent"],
         "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "warnings": res["warnings"],
     }
@@ -537,6 +548,7 @@ def subset_dataset(ctx: ToolContext, dataset_id: str, variables: list, bbox=None
         json.dumps(record, indent=2, default=str), encoding="utf-8")
     return {"ok": True, "subset_id": subset_id, "dataset_id": dataset_id,
             "output_path": res["output_path"], "shape": res["shape"],
+            "extent": res["extent"],
             "variables": res["variables"], "output_bytes": res["file_bytes"],
             "warnings": res["warnings"],
             "next_step": "Call verify_subset with this subset_id."}
@@ -637,7 +649,8 @@ def build_registry(ctx: ToolContext) -> ToolRegistry:
             "variables": {"type": "array", "items": {"type": "string"},
                           "description": "Only show these variables."},
             "include_attributes": {"type": "boolean", "default": False,
-                                   "description": "Also return global attributes."},
+                                   "description": "Also return the main global attributes "
+                                   "(title, summary, institution, references, license, comment)."},
         }, "required": ["dataset_id"]},
         get_dataset))
 

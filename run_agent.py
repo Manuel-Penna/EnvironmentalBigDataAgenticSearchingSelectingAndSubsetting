@@ -87,8 +87,11 @@ def main() -> int:
             size = sb.get("output_bytes")
             print(f"  {sb['subset_id']}  verified={sb['verified']}  shape={sb.get('shape')}  "
                   f"{'%.1f KB' % (size / 1024) if size else '?'}  {sb.get('output_path')}")
+            if sb.get("extent"):
+                print(f"    extent: {sb['extent']}")
     print(f"\n[{result.stop_reason} / {result.outcome}] {result.steps} steps, {len(result.tool_calls)} tool calls, "
-          f"{result.elapsed_s:.1f}s, tokens in/out "
+          f"{result.elapsed_s:.1f}s (LLM {result.llm_seconds:.1f}s, of which waiting on "
+          f"retries {result.retry_wait_seconds:.1f}s), tokens in/out "
           f"{result.usage['input_tokens']}/{result.usage['output_tokens']}, "
           f"format errors {result.format_errors}", file=sys.stderr)
     if result.error:
