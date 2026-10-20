@@ -58,7 +58,8 @@ def world(tmp_path):
     rec = record_from_ds(ds, tmp_path / "med.zarr", "med", "Mediterranean sea surface temperature",
                          var_meta={"long_name": "sea surface temperature"})
     ctx = ToolContext(catalog=InMemoryCatalog([rec]), output_dir=tmp_path / "subsets",
-                      default_max_bytes=10_000_000)
+                      default_max_bytes=10_000_000,
+                      require_estimate=False)   # strict mode is tested separately below
     return build_registry(ctx), ctx
 
 
@@ -92,7 +93,10 @@ def test_full_workflow(world):
     assert [c["name"] for c in res.tool_calls] == [
         "search_catalog", "get_dataset", "estimate_subset_size", "subset_dataset", "verify_subset"]
     assert all(c["ok"] for c in res.tool_calls)
-    assert res.subsets == [{"subset_id": res.subsets[0]["subset_id"], "verified": True}]
+    sb = res.subsets[0]                                  # facts come from the tool, not the model
+    assert sb["verified"] is True and sb["shape"] == {"time": 31, "lat": 6, "lon": 11}
+    assert sb["output_path"].endswith(".zarr") and sb["output_bytes"] > 0
+    assert sb["arguments"]["time"] == SUBSET_ARGS["time"]
     assert res.usage == {"input_tokens": 10, "output_tokens": 5}
     # conversation shape: system, user, then assistant/tool pairs
     assert isinstance(res.messages[0], SystemMessage) and isinstance(res.messages[1], HumanMessage)
@@ -306,6 +310,27 @@ def test_outcome_values(world):
     res = make_agent(list(verified_script), reg)[0].run("t")
     assert res.outcome == "unverified" and res.to_dict()["outcome"] == "unverified"
     assert make_agent([AIMessage(content="Which variable?")], reg)[0].run("t").outcome == "no_subset"
+
+
+def test_dropped_time_filter_is_caught_and_corrected(world):
+    """Real Groq run: the extraction call omitted `time`, so 1878 steps were extracted while
+    the answer claimed 6. Verification passed because it checks the request that was made."""
+    reg, ctx = world
+    ctx.require_estimate = True
+    dropped = {k: v for k, v in SUBSET_ARGS.items() if k != "time"}
+    script = [
+        call("estimate_subset_size", **SUBSET_ARGS),
+        call("subset_dataset", **dropped),                       # what the model really did
+        call("subset_dataset", **SUBSET_ARGS),                   # after reading the refusal
+        lambda m: call("verify_subset", subset_id=last_json(m)["subset_id"]),
+        AIMessage(content="done"),
+    ]
+    res = make_agent(script, reg)[0].run("t")
+    assert res.tool_calls[1]["error_code"] == "not_estimated"
+    refusal = [m for m in res.messages if isinstance(m, ToolMessage)][1].content
+    assert "time:" in refusal and "estimated" in refusal
+    assert res.outcome == "delivered" and len(res.subsets) == 1
+    assert res.subsets[0]["shape"]["time"] == 31                 # the corrected, estimated shape
 
 
 def test_prompt_forbids_placeholders_and_unsupported_claims():

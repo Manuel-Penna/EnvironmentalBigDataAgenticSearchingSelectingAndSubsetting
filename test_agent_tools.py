@@ -48,7 +48,8 @@ def env(tmp_path):
     catalog = InMemoryCatalog(recs)
     ctx = ToolContext(catalog=catalog, output_dir=tmp_path / "subsets",
                       default_max_bytes=10_000_000,
-                      provenance_path=tmp_path / "prov.jsonl")
+                      provenance_path=tmp_path / "prov.jsonl",
+                      require_estimate=False)   # strict mode is tested separately below
     return build_registry(ctx), ctx, catalog, tmp_path
 
 
@@ -263,3 +264,65 @@ def test_wrapping_arguments_in_a_filters_object_gets_an_actionable_error(env):
     msg = r["error"]["message"]
     assert r["error"]["code"] == "invalid_arguments"
     assert "unexpected property 'filters'" in msg and "top-level" in msg
+
+
+# ------------------------------------------- estimate-first rule (strict mode)
+EST_ARGS = {"dataset_id": "med", "variables": ["sst"],
+            "bbox": {"lat_min": 35, "lat_max": 40, "lon_min": 0, "lon_max": 10},
+            "time": {"start": "2000-03-01", "end": "2000-03-31"}}
+
+
+@pytest.fixture
+def strict(env):
+    _, _, catalog, tmp = env
+    ctx = ToolContext(catalog=catalog, output_dir=tmp / "strict")   # require_estimate=True
+    return build_registry(ctx), ctx
+
+
+def test_subset_without_any_estimate_is_refused(strict):
+    reg, ctx = strict
+    r = reg.call("subset_dataset", EST_ARGS)
+    assert r["error"]["code"] == "not_estimated" and "estimate_subset_size" in r["error"]["message"]
+    assert not list(ctx.output_dir.glob("*.zarr"))
+
+
+def test_dropping_an_estimated_argument_is_refused(strict):
+    """Real run: estimate used a time range, the extraction call left it out, so the whole
+    1870-2026 history was extracted while the answer reported the estimated shape."""
+    reg, ctx = strict
+    assert reg.call("estimate_subset_size", EST_ARGS)["ok"]
+    dropped = {k: v for k, v in EST_ARGS.items() if k != "time"}
+    r = reg.call("subset_dataset", dropped)
+    assert r["error"]["code"] == "not_estimated"
+    assert any(d.startswith("time:") for d in r["error"]["details"]["differences"])
+    assert r["error"]["details"]["last_estimated_request"]["time"] == ("2000-03-01", "2000-03-31")
+    assert not list(ctx.output_dir.glob("*.zarr"))                      # nothing was written
+    assert reg.call("subset_dataset", EST_ARGS)["ok"]                    # the estimated request works
+
+
+def test_changed_bbox_and_variables_are_refused_too(strict):
+    reg, _ = strict
+    reg.call("estimate_subset_size", EST_ARGS)
+    wider = {**EST_ARGS, "bbox": {"lat_min": 30, "lat_max": 40, "lon_min": 0, "lon_max": 10}}
+    r = reg.call("subset_dataset", wider)
+    assert any(d.startswith("bbox:") for d in r["error"]["details"]["differences"])
+
+
+def test_matching_request_is_accepted_whatever_the_order_or_limits(strict):
+    reg, _ = strict
+    reg.call("estimate_subset_size", {**EST_ARGS, "variables": ["sst"]})
+    again = {**EST_ARGS, "max_bytes": 5_000_000, "output_format": "netcdf"}   # not part of the identity
+    assert reg.call("subset_dataset", again)["ok"]
+
+
+def test_over_limit_estimate_then_same_subset_reports_too_large(strict):
+    reg, _ = strict
+    args = {**EST_ARGS, "max_bytes": 1000}
+    assert reg.call("estimate_subset_size", args)["within_limit"] is False
+    assert reg.call("subset_dataset", args)["error"]["code"] == "too_large"   # not not_estimated
+
+
+def test_rule_can_be_switched_off(env):
+    reg, ctx, *_ = env              # fixture runs with require_estimate=False
+    assert ctx.require_estimate is False
+    assert reg.call("subset_dataset", {**EST_ARGS, "variables": ["sst"]})["ok"]

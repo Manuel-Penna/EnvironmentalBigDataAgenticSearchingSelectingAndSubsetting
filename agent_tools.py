@@ -46,6 +46,8 @@ class ToolContext:
     default_max_bytes: int = 500_000_000
     provenance_path: str | Path | None = None   # JSONL, appended to on every call
     today: date | None = None                   # fixed "today" for tests; default: real date
+    require_estimate: bool = True               # subset_dataset must repeat an estimated request
+    estimated: dict[str, dict] = field(default_factory=dict)
     log: list[dict] = field(default_factory=list)
     subsets: dict[str, dict] = field(default_factory=dict)
 
@@ -307,6 +309,37 @@ def _build_request(variables, bbox, time, stride) -> dict:
     return req
 
 
+def _request_key(dataset_id: str, req: dict) -> str:
+    """Canonical identity of a subset request (size limit and output format excluded)."""
+    return json.dumps({"d": dataset_id, "v": sorted(req.get("variables") or []),
+                       "b": req.get("bbox"), "t": req.get("time"), "s": req.get("stride") or {}},
+                      sort_keys=True, default=str)
+
+
+def _canon(value: Any) -> str:
+    return json.dumps(value or None, sort_keys=True, default=str)
+
+
+def _not_estimated(ctx: ToolContext, dataset_id: str, req: dict) -> dict:
+    """subset_dataset was called with arguments that were never size-checked."""
+    previous = [e for e in ctx.estimated.values() if e["dataset_id"] == dataset_id]
+    if not previous:
+        return err("not_estimated", "Call estimate_subset_size with these arguments first; "
+                   "subset_dataset only accepts a request that was size-checked.")
+    last = previous[-1]["request"]
+    diffs = []
+    for k in ("variables", "bbox", "time", "stride"):
+        was, now = last.get(k), req.get(k)
+        if k == "variables":
+            was, now = sorted(was or []), sorted(now or [])
+        if _canon(was) != _canon(now):
+            diffs.append(f"{k}: estimated {was or 'not set'}, this call {now or 'not set'}")
+    return err("not_estimated",
+               "These arguments differ from your last estimate_subset_size for this dataset: "
+               + "; ".join(diffs) + ". Use exactly the arguments you estimated, or estimate the "
+               "new request first.", differences=diffs, last_estimated_request=last)
+
+
 def _resolve(ctx: ToolContext, dataset_id: str):
     rec = ctx.catalog.get(dataset_id)
     if rec is None:
@@ -446,11 +479,14 @@ def estimate_subset_size(ctx: ToolContext, dataset_id: str, variables: list,
     if e:
         return e
     limit = max_bytes or ctx.default_max_bytes
-    res = sub.estimate_subset_size(
-        rec["source"], _build_request(variables, bbox, time, stride),
-        max_bytes=limit, source_format=rec.get("format"))
+    request = _build_request(variables, bbox, time, stride)
+    res = sub.estimate_subset_size(rec["source"], request, max_bytes=limit,
+                                   source_format=rec.get("format"))
     if not res["ok"]:
         return _clean_error(res)
+    key = _request_key(dataset_id, request)
+    ctx.estimated.pop(key, None)   # re-insert: the most recent estimate stays last
+    ctx.estimated[key] = {"dataset_id": dataset_id, "request": request, "shape": res["shape"]}
     out = {
         "ok": True, "dataset_id": dataset_id, "shape": res["shape"],
         "output_size": res["output_human"], "output_bytes": res["output_bytes"],
@@ -474,6 +510,8 @@ def subset_dataset(ctx: ToolContext, dataset_id: str, variables: list, bbox=None
         return e
     limit = max_bytes or ctx.default_max_bytes
     request = _build_request(variables, bbox, time, stride)
+    if ctx.require_estimate and _request_key(dataset_id, request) not in ctx.estimated:
+        return _not_estimated(ctx, dataset_id, request)
     key = json.dumps({"d": dataset_id, "r": request, "f": output_format},
                      sort_keys=True, default=str)
     subset_id = "sub_" + hashlib.sha256(key.encode()).hexdigest()[:10]
@@ -607,7 +645,8 @@ def build_registry(ctx: ToolContext) -> ToolRegistry:
         "estimate_subset_size",
         "Check a planned subset BEFORE extracting it: returns the output size, how much "
         "source data would be read, and whether it fits the size limit. Also fails with a "
-        "clear reason if the region or period does not overlap the dataset. Reads no data.",
+        "clear reason if the region or period does not overlap the dataset. Reads no data. "
+        "subset_dataset only accepts a request that was estimated first.",
         {"type": "object", "properties": {
             "dataset_id": ds_id, "variables": VARIABLES_SCHEMA, "bbox": BBOX_SCHEMA,
             "time": TIME_SCHEMA, "stride": STRIDE_SCHEMA,
@@ -620,7 +659,9 @@ def build_registry(ctx: ToolContext) -> ToolRegistry:
         "subset_dataset",
         "Extract variables, a geographic box and a time range from a dataset into a new "
         "file. Refuses if the result would exceed the size limit. Returns a subset_id; "
-        "always call verify_subset on it afterwards.",
+        "always call verify_subset on it afterwards. Use EXACTLY the arguments you passed to "
+        "estimate_subset_size (same variables, bbox, time and stride); different arguments "
+        "are refused.",
         {"type": "object", "properties": {
             "dataset_id": ds_id, "variables": VARIABLES_SCHEMA, "bbox": BBOX_SCHEMA,
             "time": TIME_SCHEMA, "stride": STRIDE_SCHEMA,

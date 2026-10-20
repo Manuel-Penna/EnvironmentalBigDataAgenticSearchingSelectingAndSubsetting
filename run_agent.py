@@ -81,6 +81,12 @@ def main() -> int:
     result = agent.run(args.task)
 
     print("\n" + (result.answer or "(no answer)"))
+    if result.subsets:   # what the tools reported, so contradictions in the answer are visible
+        print("\nTool-reported facts (not written by the model):")
+        for sb in result.subsets:
+            size = sb.get("output_bytes")
+            print(f"  {sb['subset_id']}  verified={sb['verified']}  shape={sb.get('shape')}  "
+                  f"{'%.1f KB' % (size / 1024) if size else '?'}  {sb.get('output_path')}")
     print(f"\n[{result.stop_reason} / {result.outcome}] {result.steps} steps, {len(result.tool_calls)} tool calls, "
           f"{result.elapsed_s:.1f}s, tokens in/out "
           f"{result.usage['input_tokens']}/{result.usage['output_tokens']}, "
