@@ -30,7 +30,10 @@ stride = {"lat": 4, "lon": 4, "time": 2} keeps every n-th point (logical axis
 from __future__ import annotations
 
 import json
+import os
+import re
 import shutil
+import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -129,18 +132,49 @@ def _guess_format(source: str) -> str:
     return "netcdf"
 
 
+_TRANSIENT = re.compile(r"\b(429|500|502|503|504)\b|too many requests|service unavailable|"
+                        r"temporar|timed? ?out|connection (reset|aborted|refused)", re.I)
+
+
+def _is_transient(e: BaseException) -> bool:
+    """A server-side refusal that may pass (rate limit, outage, timeout), as opposed to a
+    bad path or an unreadable file."""
+    return bool(_TRANSIENT.search(str(e)))
+
+
 def open_source(source: str | Path, fmt: str | None = None) -> xr.Dataset:
-    """Open a dataset exactly the way ingestion does (same fallback chains),
-    by delegating to the extractors' ``_open_dataset``."""
+    """Open a dataset exactly the way ingestion does (same fallback chains), by delegating
+    to the extractors' ``_open_dataset``.
+
+    Remote sources are retried when the failure looks transient (HTTP 429/5xx, timeout):
+    OPEN_RETRIES extra attempts (default 1), OPEN_RETRY_DELAY seconds apart (default 10,
+    doubling). If it still fails the error code is "source_unavailable", not "open_failed",
+    so the agent can tell an outage from a wrong source."""
     s = str(source)
     fmt = fmt or _guess_format(s)
     if fmt not in {"netcdf", "zarr"}:
         raise SubsetError("bad_format", f"Unknown source format '{fmt}'.")
     extractor = ZarrExtractor() if fmt == "zarr" else NetCDFExtractor()
-    try:
-        return extractor._open_dataset(s)
-    except Exception as e:  # noqa: BLE001
-        raise SubsetError("open_failed", f"Could not open {s} as {fmt}: {e}") from e
+    remote = "://" in s
+    retries = int(os.getenv("OPEN_RETRIES", "1")) if remote else 0
+    delay = float(os.getenv("OPEN_RETRY_DELAY", "10"))
+    attempt = 0
+    while True:
+        try:
+            return extractor._open_dataset(s)
+        except Exception as e:  # noqa: BLE001
+            if remote and attempt < retries and _is_transient(e):
+                time.sleep(delay * 2 ** attempt)
+                attempt += 1
+                continue
+            if remote and _is_transient(e):
+                raise SubsetError(
+                    "source_unavailable",
+                    f"The server for {s} refused or dropped the connection (rate limit or "
+                    f"outage) after {attempt + 1} attempt(s): {str(e)[:200]}. Retrying now will "
+                    "not help; report this to the user and suggest trying again later.",
+                    attempts=attempt + 1) from e
+            raise SubsetError("open_failed", f"Could not open {s} as {fmt}: {e}") from e
 
 
 def open_if_needed(source: "str | Path | xr.Dataset",
@@ -531,14 +565,19 @@ def _path_bytes(path: Path) -> int:
     return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
 
 
+def _source_label(source: Any, label: str | None) -> str:
+    if label:
+        return label
+    return "<in-memory dataset>" if isinstance(source, xr.Dataset) else str(source)
+
+
 def _prepare_for_write(ds: xr.Dataset, fmt: str, source: Any,
-                       req: SubsetRequest) -> xr.Dataset:
+                       req: SubsetRequest, label: str | None = None) -> xr.Dataset:
     out = ds.copy()  # new Variable objects: editing encoding won't touch the source
     for v in out.variables.values():
         v.encoding = {k: val for k, val in v.encoding.items() if k in _KEEP_ENCODING}
     out.attrs = dict(out.attrs)
-    out.attrs["geometa_subset_source"] = (
-        "<in-memory dataset>" if isinstance(source, xr.Dataset) else str(source))
+    out.attrs["geometa_subset_source"] = _source_label(source, label)
     out.attrs["geometa_subset_request"] = json.dumps(req.to_dict())
 
     if any(v.chunks for v in out.data_vars.values()):
@@ -556,12 +595,15 @@ def subset_dataset(source: "str | Path | xr.Dataset",
                    fmt: str | None = None,
                    max_bytes: int | None = None,
                    overwrite: bool = False,
-                   source_format: str | None = None) -> dict:
+                   source_format: str | None = None,
+                   source_label: str | None = None) -> dict:
     """Select variables / bbox / time (+ optional stride) and write the result.
 
     fmt: "zarr" or "netcdf" (default: inferred from the output suffix, else zarr).
     max_bytes: refuse (error code "too_large") if the estimated output exceeds it.
     source_format: "netcdf" or "zarr" (the catalog's `format`); guessed if omitted.
+    source_label: what to record as the source (URL or path) when `source` is an already
+        opened Dataset, so shared handles do not turn provenance into "<in-memory dataset>".
     """
     opened = False
     ds = None
@@ -587,7 +629,7 @@ def subset_dataset(source: "str | Path | xr.Dataset",
             shutil.rmtree(out_path) if out_path.is_dir() else out_path.unlink()
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
-        out = _prepare_for_write(plan.dataset, fmt, source, plan.request)
+        out = _prepare_for_write(plan.dataset, fmt, source, plan.request, source_label)
         try:
             if fmt == "zarr":
                 out.to_zarr(out_path, mode="w")
@@ -614,8 +656,7 @@ def subset_dataset(source: "str | Path | xr.Dataset",
             "file_bytes": _path_bytes(out_path),
             "warnings": plan.warnings,
             "request": plan.request.to_dict(),
-            "source": ("<in-memory dataset>" if isinstance(source, xr.Dataset)
-                       else str(source)),
+            "source": _source_label(source, source_label),
         }
     except SubsetError as e:
         return e.to_dict()

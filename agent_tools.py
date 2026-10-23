@@ -22,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import time as _time
 import traceback
 from dataclasses import dataclass, field
@@ -33,7 +34,7 @@ import pandas as pd
 
 import subsetting as sub
 import verification as ver
-from catalog_adapters import CatalogAdapter
+from catalog_adapters import CatalogAdapter, _lon_intervals, _time_bound
 
 
 # --------------------------------------------------------------------------
@@ -50,10 +51,34 @@ class ToolContext:
     estimated: dict[str, dict] = field(default_factory=dict)
     log: list[dict] = field(default_factory=list)
     subsets: dict[str, dict] = field(default_factory=dict)
+    share_remote_handles: bool = True           # open each remote source once per run
+    _open: dict[str, Any] = field(default_factory=dict, repr=False)
 
     def __post_init__(self):
         self.output_dir = Path(self.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+
+    def open_source(self, source: str, fmt: str | None):
+        """The opened dataset for `source`. Remote sources are opened once and reused until
+        close(): estimate and subset would otherwise each hit the server again, and public
+        servers (ERDDAP, THREDDS) rate-limit. Datasets open lazily, so a handle holds only
+        metadata and the 1-D coordinates, whatever the size of the data. Local sources are
+        returned as a path (opened and closed per call, as before). Raises SubsetError."""
+        if not self.share_remote_handles or "://" not in str(source):
+            return source
+        key = f"{fmt}|{source}"
+        if key not in self._open:                    # a failed open is never cached
+            self._open[key] = sub.open_source(source, fmt)
+        return self._open[key]
+
+    def close(self) -> None:
+        """Release every shared handle. Called by the agent at the end of a run."""
+        handles, self._open = list(self._open.values()), {}
+        for ds in handles:
+            try:
+                ds.close()
+            except Exception:  # noqa: BLE001  (closing must never mask the run's result)
+                pass
 
 
 def err(code: str, message: str, **details: Any) -> dict:
@@ -488,7 +513,11 @@ def estimate_subset_size(ctx: ToolContext, dataset_id: str, variables: list,
         return e
     limit = max_bytes or ctx.default_max_bytes
     request = _build_request(variables, bbox, time, stride)
-    res = sub.estimate_subset_size(rec["source"], request, max_bytes=limit,
+    try:
+        src = ctx.open_source(rec["source"], rec.get("format"))
+    except sub.SubsetError as ex:
+        return _clean_error(ex.to_dict())
+    res = sub.estimate_subset_size(src, request, max_bytes=limit,
                                    source_format=rec.get("format"))
     if not res["ok"]:
         return _clean_error(res)
@@ -529,9 +558,13 @@ def subset_dataset(ctx: ToolContext, dataset_id: str, variables: list, bbox=None
     ext = ".zarr" if output_format == "zarr" else ".nc"
     out_path = Path(ctx.output_dir) / f"{subset_id}{ext}"
 
-    res = sub.subset_dataset(rec["source"], request, out_path, fmt=output_format,
+    try:
+        src = ctx.open_source(rec["source"], rec.get("format"))
+    except sub.SubsetError as ex:
+        return _clean_error(ex.to_dict())
+    res = sub.subset_dataset(src, request, out_path, fmt=output_format,
                              max_bytes=limit, overwrite=True,
-                             source_format=rec.get("format"))
+                             source_format=rec.get("format"), source_label=rec["source"])
     if not res["ok"]:
         return _clean_error(res)
 
@@ -602,6 +635,197 @@ def resolve_time_range(ctx: ToolContext, year=None, last_amount=None, last_unit=
     else:
         return err("bad_request", "Give either `year`, or both `last_amount` and `last_unit`.")
     return {"ok": True, "start": start, "end": end, "today": today.isoformat()}
+
+
+
+# --------------------------------------------------------------------------
+# compare_datasets: pick the best candidate for ONE task, deterministically
+# --------------------------------------------------------------------------
+_SENTINELS = (-999.0, -999.9, -9999.0, -1000.0, -32768.0, -32767.0,
+              1e20, 1e30, -1e30, 9.96921e36, 1e36)
+_LAT_DIMS = {"lat", "latitude", "y", "nav_lat", "rlat", "grid_latitude"}
+_LON_DIMS = {"lon", "longitude", "x", "nav_lon", "rlon", "grid_longitude"}
+
+
+def _suspect_fill(st: dict | None) -> list[str]:
+    """Catalog min/max that look like an unmasked fill value. A warning, not a verdict:
+    -1000 is also a legitimate bathymetry value."""
+    out = []
+    for k in ("min", "max"):
+        v = (st or {}).get(k)
+        if v is None:
+            continue
+        if abs(v) >= 1e10 or any(math.isclose(v, s, rel_tol=1e-4) for s in _SENTINELS):
+            out.append(f"{k}={v:g}")
+    return out
+
+
+def _ts(s: str) -> pd.Timestamp:
+    t = pd.Timestamp(s)
+    return t.tz_convert(None) if t.tzinfo else t
+
+
+def _time_cover(tp: dict, time) -> float | None:
+    """Fraction of the requested period that lies inside the dataset period."""
+    if not time or (time[0] is None and time[1] is None) or not tp.get("start") or not tp.get("end"):
+        return None
+    d0, d1 = _ts(tp["start"]), _ts(tp["end"])
+    r0 = _ts(_time_bound(time[0], False)) if time[0] else d0
+    r1 = _ts(_time_bound(time[1], True)) if time[1] else d1
+    if r1 <= r0:
+        return 1.0 if d0 <= r0 <= d1 else 0.0
+    return round(max(0.0, (min(r1, d1) - max(r0, d0)) / (r1 - r0)), 3)
+
+
+def _space_cover(sp: dict, bbox) -> float | None:
+    """Fraction of the requested box that lies inside the dataset extent."""
+    if not bbox or any(sp.get(k) is None for k in ("lat_min", "lat_max", "lon_min", "lon_max")):
+        return None
+    lat_min, lat_max, lon_min, lon_max = bbox
+    if lat_max > lat_min:
+        lat_f = max(0.0, min(lat_max, sp["lat_max"]) - max(lat_min, sp["lat_min"])) / (lat_max - lat_min)
+    else:
+        lat_f = 1.0 if sp["lat_min"] <= lat_min <= sp["lat_max"] else 0.0
+    total = inside = 0.0
+    for a, b in _lon_intervals(lon_min, lon_max):
+        total += b - a
+        inside += max(0.0, min(b, sp["lon_max"]) - max(a, sp["lon_min"]))
+    lon_f = inside / total if total > 0 else (
+        1.0 if any(sp["lon_min"] <= a <= sp["lon_max"] for a, _ in _lon_intervals(lon_min, lon_max)) else 0.0)
+    return round(lat_f * lon_f, 3)
+
+
+def _norm(s: Any) -> str:
+    return re.sub(r"[\s_\-]+", " ", str(s or "").lower()).strip()
+
+
+def _match_score(v: dict, term: str) -> int:
+    """3 = the term is the variable name or its standard_name; 2 = all its words are in
+    long_name/standard_name; 1 = it appears inside name/long_name/standard_name; 0 = no match."""
+    t = _norm(term)
+    a = v.get("attributes") or {}
+    name, std, long_ = _norm(v["name"]), _norm(a.get("standard_name")), _norm(a.get("long_name"))
+    if t and t in (name, std):
+        return 3
+    words = set(t.split())
+    if words and (words <= set(std.split()) or words <= set(long_.split())):
+        return 2
+    return 1 if t and t in f"{name} {std} {long_}" else 0
+
+
+def _grid_info(v: dict, sp: dict) -> dict:
+    """Is the variable on a regular lat/lon grid (so bbox subsetting can work), and how fine."""
+    dims = [str(d) for d in (v.get("dimensions") or [])]
+    lat_d = next((d for d in dims if d.lower() in _LAT_DIMS), None)
+    lon_d = next((d for d in dims if d.lower() in _LON_DIMS), None)
+    info: dict[str, Any] = {"gridded": bool(lat_d and lon_d), "dims": dims}
+    shape = dict(zip(dims, v.get("shape") or []))
+    for key, d in (("lat", lat_d), ("lon", lon_d)):
+        n = shape.get(d)
+        if d and n and n > 1 and sp.get(f"{key}_min") is not None:
+            info[f"{key}_step_deg"] = round((sp[f"{key}_max"] - sp[f"{key}_min"]) / (n - 1), 4)
+    return info
+
+
+def compare_datasets(ctx: ToolContext, dataset_ids: list, variable=None, bbox=None, time=None) -> dict:
+    if len(set(dataset_ids)) < 2 or len(set(dataset_ids)) > 4:
+        return err("bad_request", "Give between 2 and 4 different dataset_ids.")
+    bb, tt = _bbox_tuple(bbox), _time_tuple(time)
+    rows, unknown = [], []
+    for did in dict.fromkeys(dataset_ids):
+        rec = ctx.catalog.get(did)
+        if rec is None:
+            unknown.append(did)
+            continue
+        sp, tp = rec.get("spatial") or {}, rec.get("temporal") or {}
+        flags: list[str] = []
+        eligible = True
+        row: dict[str, Any] = {
+            "dataset_id": did,
+            "title": _trim((rec.get("global_attributes") or {}).get("title"), 100),
+            "format": rec.get("format"),
+            "period": [tp.get("start"), tp.get("end")],
+            "extent": sp or None,
+            "coverage": {"space": _space_cover(sp, bb), "time": _time_cover(tp, tt)},
+        }
+        if variable:
+            ranked = sorted(((_match_score(v, variable), v) for v in rec.get("variables", [])),
+                            key=lambda x: -x[0])
+            ranked = [(s_, v) for s_, v in ranked if s_ > 0]
+            if not ranked:
+                flags.append(f"no variable matches '{variable}'")
+                eligible = False
+            else:
+                best = ranked[0][1]
+                s_ = _var_summary(best)
+                row["variable"] = {k: s_[k] for k in ("name", "long_name", "standard_name", "units",
+                                                      "shape", "stats") if k in s_}
+                row["match_strength"] = ranked[0][0]
+                grid = _grid_info(best, sp)
+                row["grid"] = grid
+                if len([1 for x, _ in ranked if x == ranked[0][0]]) > 1:
+                    flags.append(f"several variables match equally well; showing '{best['name']}'")
+                if bb and not grid["gridded"]:
+                    flags.append("variable is not on a regular lat/lon grid (dims: "
+                                 f"{grid['dims']}); bbox subsetting is likely to be rejected "
+                                 "(unsupported_grid)")
+                    eligible = False
+                bad = _suspect_fill(best.get("statistics"))
+                if bad:
+                    flags.append("catalog statistics look like an unmasked fill value ("
+                                 + ", ".join(bad) + "); verify_subset's range check is unreliable here")
+                nf = (row["variable"].get("stats") or {}).get("nan_fraction")
+                if nf is not None and nf > 0.5:
+                    flags.append(f"{nf:.0%} of values are NaN")
+        for k, label in (("space", "region"), ("time", "period")):
+            c = row["coverage"][k]
+            if c is not None and c == 0:
+                flags.append(f"does not cover the requested {label} at all")
+                eligible = False
+            elif c is not None and c < 1:
+                flags.append(f"covers only {'<1%' if c < 0.005 else format(c, '.0%')} of the requested {label}")
+        if eligible is False:
+            row["eligible"] = False
+        if flags:
+            row["flags"] = flags
+        row["_score"] = round((row["coverage"]["space"] if row["coverage"]["space"] is not None else 1.0)
+                              * (row["coverage"]["time"] if row["coverage"]["time"] is not None else 1.0), 3)
+        row["_eligible"] = eligible
+        rows.append(row)
+    if not rows:
+        return err("unknown_dataset", "None of the dataset_ids exist.", unknown=unknown)
+
+    # eligible first, then coverage, then strength of the variable match, then fewer flags
+    rows.sort(key=lambda r: (not r["_eligible"], -r["_score"], -(r.get("match_strength") or 0),
+                             len(r.get("flags", []))))
+    good = [r for r in rows if r["_eligible"]]
+    out: dict[str, Any] = {"ok": True, "n": len(rows)}
+    if not good:
+        out["recommended"] = None
+        out["recommendation"] = ("No candidate fits: each fails on variable, grid or coverage (see flags). "
+                                 "Relax the request or search again; do not extract a poor match "
+                                 "without telling the user.")
+    else:
+        top = good[0]
+        out["recommended"] = top["dataset_id"]
+        close = len(good) > 1 and (top["_score"] - good[1]["_score"]) < 0.1
+        out["confidence"] = "close" if close else "clear"
+        why = [f"covers {top['_score']:.0%} of the requested region x period"]
+        if len(good) > 1:
+            why.append(f"next best covers {good[1]['_score']:.0%}")
+        out["recommendation"] = "; ".join(why) + "."
+        if close:
+            out["recommendation"] += (" Candidates are close on coverage: decide on grid spacing, "
+                                      "units and flags against what the user asked for.")
+    for r in rows:
+        r.pop("_score"), r.pop("_eligible")
+    out["datasets"] = rows
+    out["ranking_basis"] = ("fit first (variable matches, regular lat/lon grid when a region is "
+                            "requested, some coverage), then coverage of region x period. Grid spacing "
+                            "and units are shown but not ranked: judge them against the task.")
+    if unknown:
+        out["unknown_dataset_ids"] = unknown
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -694,4 +918,19 @@ def build_registry(ctx: ToolContext) -> ToolRegistry:
                           "description": "The subset_id returned by subset_dataset."},
         }, "required": ["subset_id"]},
         verify_subset))
+
+    reg.register(Tool(
+        "compare_datasets",
+        "Compare 2 to 4 candidate datasets for the same task and get a recommendation: how much of "
+        "the requested region and period each covers, the matching variable with units, grid "
+        "spacing, NaN fraction, whether it is on a regular lat/lon grid, and flags (partial "
+        "coverage, suspicious statistics). Returns `recommended` (a dataset_id or null) with the "
+        "reason. Use it after search_catalog when there are 2 or more candidates.",
+        {"type": "object", "properties": {
+            "dataset_ids": {"type": "array", "items": {"type": "string"}, "minItems": 2,
+                            "description": "dataset_ids returned by search_catalog."},
+            "variable": {"type": "string", "description": "Topic or variable name, e.g. 'sea surface temperature'."},
+            "bbox": BBOX_SCHEMA, "time": TIME_SCHEMA,
+        }, "required": ["dataset_ids"]},
+        compare_datasets))
     return reg

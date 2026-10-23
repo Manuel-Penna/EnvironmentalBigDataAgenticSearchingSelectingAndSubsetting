@@ -57,7 +57,7 @@ def env(tmp_path):
 def test_schemas_for_both_backends(env):
     reg, *_ = env
     names = {"resolve_time_range", "search_catalog", "get_dataset",
-             "estimate_subset_size", "subset_dataset", "verify_subset"}
+             "estimate_subset_size", "subset_dataset", "verify_subset", "compare_datasets"}
     assert set(reg.names) == names
     for t in reg.anthropic_tools():
         assert t["input_schema"]["type"] == "object" and t["description"]
