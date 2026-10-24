@@ -87,6 +87,7 @@ class BaseScientificExtractor(ABC):
                     attributes=self._safe_convert_dict(var.attrs),
                     chunks=chunks,
                     statistics=statistics,
+                    long_name=str(var.attrs.get("long_name") or var.attrs.get("standard_name")),
                 )
                 variables.append(variable_metadata)
 

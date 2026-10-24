@@ -344,7 +344,7 @@ function renderVariables(variables) {
         return `
         <div class="var-row">
             <div class="var-name">
-                <code>${v.name}</code>
+                <code>${v.name}${v.long_name ? " – " + v.long_name : ""}</code>
                 <span class="var-meta">${v.dtype} ${v.shape.join("×")}</span>
             </div>
             <div class="var-stats">${statsHtml}</div>

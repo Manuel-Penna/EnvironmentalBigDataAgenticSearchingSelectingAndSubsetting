@@ -32,6 +32,7 @@ class VariableMetadata:
     attributes: dict[str, Any]
     chunks: list[list[int]] | None = None
     statistics: VariableStatistics | None = None
+    long_name : str = ""
 
 
 @dataclass
