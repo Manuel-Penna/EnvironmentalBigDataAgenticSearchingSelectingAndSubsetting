@@ -623,18 +623,13 @@ def verify_subset(ctx: ToolContext, subset_id: str) -> dict:
             "issues": res["issues"][:20], "variables": summary}
 
 
-def resolve_time_range(ctx: ToolContext, year=None, last_amount=None, last_unit=None) -> dict:
-    """Date arithmetic in code, not in the LLM."""
+def resolve_time_range(ctx: ToolContext, last_amount: int, last_unit: str) -> dict:
+    """Relative periods only ("the last N days/months/years"); date arithmetic in code."""
     today = ctx.today or date.today()
-    if year is not None and last_amount is None and last_unit is None:
-        start, end = f"{year:04d}-01-01", f"{year:04d}-12-31"
-    elif last_amount is not None and last_unit is not None and year is None:
-        end_ts = pd.Timestamp(today)
-        start_ts = end_ts - pd.DateOffset(**{last_unit: last_amount})
-        start, end = start_ts.date().isoformat(), end_ts.date().isoformat()
-    else:
-        return err("bad_request", "Give either `year`, or both `last_amount` and `last_unit`.")
-    return {"ok": True, "start": start, "end": end, "today": today.isoformat()}
+    end_ts = pd.Timestamp(today)
+    start_ts = end_ts - pd.DateOffset(**{last_unit: last_amount})
+    return {"ok": True, "start": start_ts.date().isoformat(),
+            "end": end_ts.date().isoformat(), "today": today.isoformat()}
 
 
 
@@ -874,15 +869,14 @@ def build_registry(ctx: ToolContext) -> ToolRegistry:
 
     reg.register(Tool(
         "resolve_time_range",
-        "Convert a calendar year ('2019') or a relative period ('the last 5 years') into "
-        "exact start and end dates for the `time` filters. Always use this instead of "
-        "working out dates yourself.",
+        "Convert a RELATIVE period ('the last 5 years', 'the last 3 months') into exact "
+        "start and end dates for the `time` filters, counting back from today. Use it only "
+        "for relative periods; write explicit dates (including whole calendar years) yourself.",
         {"type": "object", "properties": {
-            "year": {"type": "integer", "minimum": 1800, "maximum": 2200},
             "last_amount": {"type": "integer", "minimum": 1,
-                            "description": "With last_unit: 'the last N units' up to today."},
+                            "description": "'the last N units' up to today."},
             "last_unit": {"type": "string", "enum": ["days", "months", "years"]},
-        }},
+        }, "required": ["last_amount", "last_unit"]},
         resolve_time_range))
 
     reg.register(Tool(
