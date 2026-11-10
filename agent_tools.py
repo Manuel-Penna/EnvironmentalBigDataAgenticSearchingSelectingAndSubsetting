@@ -665,13 +665,14 @@ def _ts(s: str) -> pd.Timestamp:
     return t.tz_convert(None) if t.tzinfo else t
 
 
-def _time_cover(tp: dict, time) -> float | None:
-    """Fraction of the requested period that lies inside the dataset period."""
+def _time_cover(tp, time):
     if not time or (time[0] is None and time[1] is None) or not tp.get("start") or not tp.get("end"):
         return None
     d0, d1 = _ts(tp["start"]), _ts(tp["end"])
     r0 = _ts(_time_bound(time[0], False)) if time[0] else d0
     r1 = _ts(_time_bound(time[1], True)) if time[1] else d1
+    if d0 == d1:                       # one time step: covered if it falls in the window
+        return 1.0 if r0 <= d0 <= r1 else 0.0
     if r1 <= r0:
         return 1.0 if d0 <= r0 <= d1 else 0.0
     return round(max(0.0, (min(r1, d1) - max(r0, d0)) / (r1 - r0)), 3)
@@ -726,11 +727,26 @@ def _grid_info(v: dict, sp: dict) -> dict:
             info[f"{key}_step_deg"] = round((sp[f"{key}_max"] - sp[f"{key}_min"]) / (n - 1), 4)
     return info
 
+_TIME_DIMS = {"time", "t", "valid_time"}
+
+def _time_step_days(v: dict, tp: dict) -> float | None:
+    dims = [str(d) for d in (v.get("dimensions") or [])]
+    td = next((d for d in dims if d.lower() in _TIME_DIMS), None)
+    n = dict(zip(dims, v.get("shape") or [])).get(td) if td else None
+    if not n or n < 2 or not tp.get("start") or not tp.get("end"):
+        return None
+    return round((_ts(tp["end"]) - _ts(tp["start"])).total_seconds() / 86400 / (n - 1), 2)
+
+def _window_days(tt) -> float | None:
+    if not tt or not (tt[0] and tt[1]):
+        return None
+    return max((_ts(_time_bound(tt[1], True)) - _ts(_time_bound(tt[0], False))).total_seconds() / 86400, 0)
 
 def compare_datasets(ctx: ToolContext, dataset_ids: list, variable=None, bbox=None, time=None) -> dict:
     if len(set(dataset_ids)) < 2 or len(set(dataset_ids)) > 4:
         return err("bad_request", "Give between 2 and 4 different dataset_ids.")
     bb, tt = _bbox_tuple(bbox), _time_tuple(time)
+    win = _window_days(tt)
     rows, unknown = [], []
     for did in dict.fromkeys(dataset_ids):
         rec = ctx.catalog.get(did)
@@ -740,6 +756,7 @@ def compare_datasets(ctx: ToolContext, dataset_ids: list, variable=None, bbox=No
         sp, tp = rec.get("spatial") or {}, rec.get("temporal") or {}
         flags: list[str] = []
         eligible = True
+        coarse = False
         row: dict[str, Any] = {
             "dataset_id": did,
             "title": _trim((rec.get("global_attributes") or {}).get("title"), 100),
@@ -763,6 +780,15 @@ def compare_datasets(ctx: ToolContext, dataset_ids: list, variable=None, bbox=No
                 row["match_strength"] = ranked[0][0]
                 grid = _grid_info(best, sp)
                 row["grid"] = grid
+
+                step = _time_step_days(best, tp)
+                if step is not None:
+                    row["time_step_days"] = step
+                if step is not None and win is not None and step > win:
+                    coarse = True
+                    flags.append(f"time step is about {step:g} days, longer than the requested "
+                                 f"period ({win:g} days): the period may contain no time step")
+
                 if len([1 for x, _ in ranked if x == ranked[0][0]]) > 1:
                     flags.append(f"several variables match equally well; showing '{best['name']}'")
                 if bb and not grid["gridded"]:
@@ -791,13 +817,15 @@ def compare_datasets(ctx: ToolContext, dataset_ids: list, variable=None, bbox=No
         row["_score"] = round((row["coverage"]["space"] if row["coverage"]["space"] is not None else 1.0)
                               * (row["coverage"]["time"] if row["coverage"]["time"] is not None else 1.0), 3)
         row["_eligible"] = eligible
+        row["_coarse"] = coarse
         rows.append(row)
     if not rows:
         return err("unknown_dataset", "None of the dataset_ids exist.", unknown=unknown)
 
-    # eligible first, then coverage, then strength of the variable match, then fewer flags
-    rows.sort(key=lambda r: (not r["_eligible"], -r["_score"], -(r.get("match_strength") or 0),
-                             len(r.get("flags", []))))
+    # eligible first, then time step fine enough for the period, then coverage,
+    # then strength of the variable match, then fewer flags
+    rows.sort(key=lambda r: (not r["_eligible"], r["_coarse"], -r["_score"],
+                             -(r.get("match_strength") or 0), len(r.get("flags", []))))
     good = [r for r in rows if r["_eligible"]]
     out: dict[str, Any] = {"ok": True, "n": len(rows)}
     if not good:
@@ -808,21 +836,30 @@ def compare_datasets(ctx: ToolContext, dataset_ids: list, variable=None, bbox=No
     else:
         top = good[0]
         out["recommended"] = top["dataset_id"]
-        close = len(good) > 1 and (top["_score"] - good[1]["_score"]) < 0.1
+        close = (len(good) > 1 and top["_coarse"] == good[1]["_coarse"]
+                 and (top["_score"] - good[1]["_score"]) < 0.1)
         out["confidence"] = "close" if close else "clear"
         why = [f"covers {top['_score']:.0%} of the requested region x period"]
         if len(good) > 1:
             why.append(f"next best covers {good[1]['_score']:.0%}")
         out["recommendation"] = "; ".join(why) + "."
+        if len(good) > 1 and good[1]["_coarse"] and not top["_coarse"]:
+            out["recommendation"] += (" The alternatives have a time step longer than the requested "
+                                      "period, so they may contain no data for it.")
+        if top["_coarse"]:
+            out["recommendation"] += (" Every eligible candidate has a time step longer than the "
+                                      "requested period: tell the user the result will be coarser "
+                                      "than asked, or that it may be empty.")
         if close:
             out["recommendation"] += (" Candidates are close on coverage: decide on grid spacing, "
                                       "units and flags against what the user asked for.")
     for r in rows:
-        r.pop("_score"), r.pop("_eligible")
+        r.pop("_score"), r.pop("_eligible"), r.pop("_coarse")
     out["datasets"] = rows
     out["ranking_basis"] = ("fit first (variable matches, regular lat/lon grid when a region is "
-                            "requested, some coverage), then coverage of region x period. Grid spacing "
-                            "and units are shown but not ranked: judge them against the task.")
+                            "requested, some coverage), then time step not longer than the requested "
+                            "period, then coverage of region x period. Grid spacing and units are shown "
+                            "but not ranked: judge them against the task.")
     if unknown:
         out["unknown_dataset_ids"] = unknown
     return out

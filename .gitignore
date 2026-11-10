@@ -8,3 +8,6 @@ files
 agents
 runs
 subsets
+.pytest_cache
+eval_runs
+inspect_catalog.py
