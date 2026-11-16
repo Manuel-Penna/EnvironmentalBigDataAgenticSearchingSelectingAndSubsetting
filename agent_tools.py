@@ -448,6 +448,26 @@ def _size_hints(est: dict, max_bytes: int) -> list[str]:
 
 
 # --------------------------------------------------------------------------
+# Fill-value detection (shared by compare_datasets and verify_subset)
+# --------------------------------------------------------------------------
+_SENTINELS = (-999.0, -999.9, -9999.0, -1000.0, -32768.0, -32767.0,
+              1e20, 1e30, -1e30, 9.96921e36, 1e36)
+
+
+def _suspect_fill(st: dict | None) -> list[str]:
+    """min/max that look like an unmasked fill value. A warning, not a verdict:
+    -1000 is also a legitimate bathymetry value."""
+    out = []
+    for k in ("min", "max"):
+        v = (st or {}).get(k)
+        if v is None:
+            continue
+        if abs(v) >= 1e10 or any(math.isclose(v, s, rel_tol=1e-4) for s in _SENTINELS):
+            out.append(f"{k}={v:g}")
+    return out
+
+
+# --------------------------------------------------------------------------
 # The tools
 # --------------------------------------------------------------------------
 def search_catalog(ctx: ToolContext, query=None, format=None, bbox=None, time=None,
@@ -527,6 +547,9 @@ def estimate_subset_size(ctx: ToolContext, dataset_id: str, variables: list,
     out = {
         "ok": True, "dataset_id": dataset_id, "shape": res["shape"],
         "output_size": res["output_human"], "output_bytes": res["output_bytes"],
+        # uncompressed array bytes: this is the value the size limit applies to. The file
+        # written by subset_dataset can be smaller (compression); see its `file_bytes`.
+        "array_bytes": res["output_bytes"],
         "data_read": res["read_human"], "read_amplification": res["read_amplification"],
         "max_bytes": limit, "within_limit": res["within_limit"],
         "warnings": res["warnings"],
@@ -582,7 +605,9 @@ def subset_dataset(ctx: ToolContext, dataset_id: str, variables: list, bbox=None
     return {"ok": True, "subset_id": subset_id, "dataset_id": dataset_id,
             "output_path": res["output_path"], "shape": res["shape"],
             "extent": res["extent"],
-            "variables": res["variables"], "output_bytes": res["file_bytes"],
+            "variables": res["variables"],
+            "output_bytes": res["file_bytes"],   # kept for compatibility
+            "file_bytes": res["file_bytes"],     # size on disk (compressed), not the limit's basis
             "warnings": res["warnings"],
             "next_step": "Call verify_subset with this subset_id."}
 
@@ -600,12 +625,17 @@ def verify_subset(ctx: ToolContext, subset_id: str) -> dict:
 
     rec = ctx.catalog.get(record["dataset_id"]) or {}
     wanted = set(record["variables"])
-    ref, units = {}, {}
+    ref, units, notes = {}, {}, []
     for v in rec.get("variables", []):
         if v["name"] not in wanted:
             continue
         st = v.get("statistics") or {}
-        if st.get("min") is not None and st.get("max") is not None:
+        bad = _suspect_fill(st)
+        if bad:
+            # the catalog range would accept a leaked fill value: do not use it
+            notes.append(f"{v['name']}: catalog statistics look like an unmasked fill value "
+                         f"({', '.join(bad)}); the range check against the catalog was skipped.")
+        elif st.get("min") is not None and st.get("max") is not None:
             ref[v["name"]] = {"min": st["min"], "max": st["max"]}
         u = (v.get("attributes") or {}).get("units")
         if u:
@@ -613,14 +643,51 @@ def verify_subset(ctx: ToolContext, subset_id: str) -> dict:
 
     res = ver.verify_subset(record["output_path"], record["request"],
                             reference_stats=ref, expected_units=units)
+
+    # Independent of the catalog: fill-value-like values inside the written subset
+    issues = list(res["issues"])
+    n_extra = 0
+    for name, info in res["summary"].items():
+        leaked = _suspect_fill({"min": info.get("min"), "max": info.get("max")})
+        if leaked:
+            issues.append({"severity": "error", "code": "sentinel_value", "variable": name,
+                           "message": f"the subset contains fill-value-like values "
+                                      f"({', '.join(leaked)}); they are probably not real "
+                                      "measurements."})
+            n_extra += 1
+
     summary = {
         name: {k: info[k] for k in ("min", "max", "mean", "nan_fraction", "units")
                if info.get(k) is not None}
         for name, info in res["summary"].items()
     }
-    return {"ok": True, "subset_id": subset_id, "verified": res["ok"],
-            "n_errors": res["n_errors"], "n_warnings": res["n_warnings"],
-            "issues": res["issues"][:20], "variables": summary}
+    n_errors = res["n_errors"] + n_extra
+    out = {"ok": True, "subset_id": subset_id, "verified": res["ok"] and n_extra == 0,
+           "n_errors": n_errors, "n_warnings": res["n_warnings"],
+           "issues": issues[:20], "variables": summary}
+    if notes:
+        out["notes"] = notes
+
+    # What was actually checked, so the final answer can say exactly this and nothing more.
+    codes = {i["code"] for i in issues}
+    if notes:
+        range_check = "skipped (catalog statistics unreliable)"
+    elif not ref:
+        range_check = "not available (no catalog statistics)"
+    else:
+        range_check = "failed" if "outside_reference_range" in codes else "passed"
+    if "coords_outside_request" in codes:
+        coord_check = "failed"
+    elif codes & {"axis_not_found", "time_check_failed"}:
+        coord_check = "incomplete"
+    else:
+        coord_check = "passed"
+    out["checks"] = {
+        "catalog_range": range_check,
+        "sentinel_scan": "failed" if n_extra else "passed",
+        "coordinates_vs_request": coord_check,
+    }
+    return out
 
 
 def resolve_time_range(ctx: ToolContext, last_amount: int, last_unit: str) -> dict:
@@ -632,27 +699,11 @@ def resolve_time_range(ctx: ToolContext, last_amount: int, last_unit: str) -> di
             "end": end_ts.date().isoformat(), "today": today.isoformat()}
 
 
-
 # --------------------------------------------------------------------------
 # compare_datasets: pick the best candidate for ONE task, deterministically
 # --------------------------------------------------------------------------
-_SENTINELS = (-999.0, -999.9, -9999.0, -1000.0, -32768.0, -32767.0,
-              1e20, 1e30, -1e30, 9.96921e36, 1e36)
 _LAT_DIMS = {"lat", "latitude", "y", "nav_lat", "rlat", "grid_latitude"}
 _LON_DIMS = {"lon", "longitude", "x", "nav_lon", "rlon", "grid_longitude"}
-
-
-def _suspect_fill(st: dict | None) -> list[str]:
-    """Catalog min/max that look like an unmasked fill value. A warning, not a verdict:
-    -1000 is also a legitimate bathymetry value."""
-    out = []
-    for k in ("min", "max"):
-        v = (st or {}).get(k)
-        if v is None:
-            continue
-        if abs(v) >= 1e10 or any(math.isclose(v, s, rel_tol=1e-4) for s in _SENTINELS):
-            out.append(f"{k}={v:g}")
-    return out
 
 
 def _ts(s: str) -> pd.Timestamp:
@@ -666,8 +717,13 @@ def _time_cover(tp, time):
     d0, d1 = _ts(tp["start"]), _ts(tp["end"])
     r0 = _ts(_time_bound(time[0], False)) if time[0] else d0
     r1 = _ts(_time_bound(time[1], True)) if time[1] else d1
-    if d0 == d1:                       # one time step: covered if it falls in the window
-        return 1.0 if r0 <= d0 <= r1 else 0.0
+    if d0 == d1:
+        # One time step is an instant, not a period. It is assumed to stand for one day, so
+        # it covers a one-day request completely but only a sliver of a multi-year one.
+        if not (r0 <= d0 <= r1):
+            return 0.0
+        window_days = (r1 - r0).total_seconds() / 86400
+        return round(min(1.0, 1.0 / max(window_days, 1.0)), 4)
     if r1 <= r0:
         return 1.0 if d0 <= r0 <= d1 else 0.0
     return round(max(0.0, (min(r1, d1) - max(r0, d0)) / (r1 - r0)), 3)
@@ -722,7 +778,9 @@ def _grid_info(v: dict, sp: dict) -> dict:
             info[f"{key}_step_deg"] = round((sp[f"{key}_max"] - sp[f"{key}_min"]) / (n - 1), 4)
     return info
 
+
 _TIME_DIMS = {"time", "t", "valid_time"}
+
 
 def _time_step_days(v: dict, tp: dict) -> float | None:
     dims = [str(d) for d in (v.get("dimensions") or [])]
@@ -732,10 +790,12 @@ def _time_step_days(v: dict, tp: dict) -> float | None:
         return None
     return round((_ts(tp["end"]) - _ts(tp["start"])).total_seconds() / 86400 / (n - 1), 2)
 
+
 def _window_days(tt) -> float | None:
     if not tt or not (tt[0] and tt[1]):
         return None
     return max((_ts(_time_bound(tt[1], True)) - _ts(_time_bound(tt[0], False))).total_seconds() / 86400, 0)
+
 
 def compare_datasets(ctx: ToolContext, dataset_ids: list, variable=None, bbox=None, time=None) -> dict:
     if len(set(dataset_ids)) < 2 or len(set(dataset_ids)) > 4:
@@ -760,6 +820,8 @@ def compare_datasets(ctx: ToolContext, dataset_ids: list, variable=None, bbox=No
             "extent": sp or None,
             "coverage": {"space": _space_cover(sp, bb), "time": _time_cover(tp, tt)},
         }
+        if tp.get("start") and tp.get("start") == tp.get("end"):
+            flags.append(f"single time step ({str(tp['start'])[:10]})")
         if variable:
             ranked = sorted(((_match_score(v, variable), v) for v in rec.get("variables", [])),
                             key=lambda x: -x[0])
@@ -794,7 +856,8 @@ def compare_datasets(ctx: ToolContext, dataset_ids: list, variable=None, bbox=No
                 bad = _suspect_fill(best.get("statistics"))
                 if bad:
                     flags.append("catalog statistics look like an unmasked fill value ("
-                                 + ", ".join(bad) + "); verify_subset's range check is unreliable here")
+                                 + ", ".join(bad) + "); verify_subset skips the catalog range "
+                                 "check for this variable and scans the subset for such values instead")
                 nf = (row["variable"].get("stats") or {}).get("nan_fraction")
                 if nf is not None and nf > 0.5:
                     flags.append(f"{nf:.0%} of values are NaN")
@@ -810,17 +873,18 @@ def compare_datasets(ctx: ToolContext, dataset_ids: list, variable=None, bbox=No
         if flags:
             row["flags"] = flags
         row["_score"] = round((row["coverage"]["space"] if row["coverage"]["space"] is not None else 1.0)
-                              * (row["coverage"]["time"] if row["coverage"]["time"] is not None else 1.0), 3)
+                              * (row["coverage"]["time"] if row["coverage"]["time"] is not None else 1.0), 4)
         row["_eligible"] = eligible
         row["_coarse"] = coarse
         rows.append(row)
     if not rows:
         return err("unknown_dataset", "None of the dataset_ids exist.", unknown=unknown)
 
-    # eligible first, then time step fine enough for the period, then coverage,
-    # then strength of the variable match, then fewer flags
+    # eligible first, then time step fine enough for the period, then coverage, then strength
+    # of the variable match. The number of flags is NOT a criterion: a flag informs, it does
+    # not say whether a dataset fits the task.
     rows.sort(key=lambda r: (not r["_eligible"], r["_coarse"], -r["_score"],
-                             -(r.get("match_strength") or 0), len(r.get("flags", []))))
+                             -(r.get("match_strength") or 0)))
     good = [r for r in rows if r["_eligible"]]
     out: dict[str, Any] = {"ok": True, "n": len(rows)}
     if not good:
@@ -941,9 +1005,12 @@ def build_registry(ctx: ToolContext) -> ToolRegistry:
     reg.register(Tool(
         "verify_subset",
         "Check an extracted subset: is it empty, all NaN, outside the requested region or "
-        "period, in unexpected units, or outside the value range known for the dataset? "
-        "Returns issues with severity 'error' or 'warning'. 'verified: false' means the "
-        "subset is not trustworthy.",
+        "period, in unexpected units, or outside the value range known for the dataset? It "
+        "also looks for fill-value-like values (such as -1000 or 1e20) inside the subset. "
+        "Returns issues with severity 'error' or 'warning', `checks` (which checks passed, "
+        "failed or were skipped) and `notes` when part of the check could not be done. "
+        "Describe only the checks listed there. 'verified: false' means the subset is "
+        "not trustworthy.",
         {"type": "object", "properties": {
             "subset_id": {"type": "string",
                           "description": "The subset_id returned by subset_dataset."},
