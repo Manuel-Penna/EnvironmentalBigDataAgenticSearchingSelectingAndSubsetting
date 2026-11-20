@@ -17,6 +17,7 @@ Rules every tool follows
 * Every call is logged (provenance) with its arguments and outcome.
 """
 
+
 from __future__ import annotations
 
 import hashlib
@@ -413,8 +414,9 @@ def _search_hit(rec: dict) -> dict:
         "dataset_id": rec["dataset_id"], "title": _trim(attrs.get("title"), 120),
         "score": rec.get("score"), "matched_via": rec.get("matched_via"),
         "format": rec.get("format"), "spatial": rec.get("spatial"),
-        "temporal": rec.get("temporal"), "n_variables": len(vars_),
-        "variables": labels,
+        "temporal": rec.get("temporal"),
+        "time_resolution": _time_resolution(_dataset_time_step(rec)),
+        "n_variables": len(vars_), "variables": labels,
     }.items() if val is not None}
 
 
@@ -512,6 +514,7 @@ def get_dataset(ctx: ToolContext, dataset_id: str, variables=None,
         "institution": attrs.get("institution"),
         "format": rec.get("format"), "is_remote": rec.get("is_remote"),
         "spatial": rec.get("spatial"), "temporal": rec.get("temporal"),
+        "time_resolution": _time_resolution(_dataset_time_step(rec)),
         "dimensions": rec.get("dimensions"),
         "variables": [_var_summary(v) for v in chosen],
         "warnings": (rec.get("warnings") or [])[:5],
@@ -711,7 +714,37 @@ def _ts(s: str) -> pd.Timestamp:
     return t.tz_convert(None) if t.tzinfo else t
 
 
-def _time_cover(tp, time):
+def _dataset_time_step(rec: dict) -> float | None:
+    """Mean spacing of the dataset's time axis in days (None: unknown or a single step)."""
+    tp = rec.get("temporal") or {}
+    n = next((v for k, v in (rec.get("dimensions") or {}).items()
+              if str(k).lower() in _TIME_DIMS), None)
+    if not n or n < 2 or not tp.get("start") or not tp.get("end"):
+        return None
+    return round((_ts(tp["end"]) - _ts(tp["start"])).total_seconds() / 86400 / (n - 1), 2)
+
+
+def _time_resolution(step: float | None) -> str | None:
+    """Human label for a time step in days, so the answer can say 'monthly', not 'daily'."""
+    if step is None:
+        return None
+    if step < 0.9:
+        return f"sub-daily (~{step * 24:g} h)"
+    for lo, hi, label in ((0.9, 1.1, "daily"), (6, 8, "weekly"), (27, 32, "monthly"),
+                          (85, 95, "seasonal"), (360, 370, "yearly")):
+        if lo <= step <= hi:
+            return label
+    return f"~{step:g} days"
+
+
+def _time_cover(tp, time, step_days=None):
+    """Fraction of the requested period that the dataset's time axis covers.
+
+    A time stamp on a coarse axis stands for a whole period, not an instant: monthly data
+    stamped 2016-01-01 ... 2016-12-01 covers all of 2016, December included. So when the time
+    step is longer than a day the stored period is widened by half a step on each side, and a
+    shortfall of at most one step at the edges is not counted as missing, provided the dataset
+    overlaps the request at all."""
     if not time or (time[0] is None and time[1] is None) or not tp.get("start") or not tp.get("end"):
         return None
     d0, d1 = _ts(tp["start"]), _ts(tp["end"])
@@ -726,6 +759,14 @@ def _time_cover(tp, time):
         return round(min(1.0, 1.0 / max(window_days, 1.0)), 4)
     if r1 <= r0:
         return 1.0 if d0 <= r0 <= d1 else 0.0
+    if step_days and step_days > 1.5:
+        half = pd.Timedelta(days=step_days / 2)
+        overlap = (min(r1, d1 + half) - max(r0, d0 - half)).total_seconds()
+        if overlap <= 0:
+            return 0.0
+        if (r1 - r0).total_seconds() - overlap <= step_days * 86400:
+            return 1.0
+        return round(overlap / (r1 - r0).total_seconds(), 3)
     return round(max(0.0, (min(r1, d1) - max(r0, d0)) / (r1 - r0)), 3)
 
 
@@ -765,6 +806,25 @@ def _match_score(v: dict, term: str) -> int:
     return 1 if t and t in f"{name} {std} {long_}" else 0
 
 
+# Variables that describe the quantity rather than being it (anomaly, error, ...). When several
+# variables match the term equally well, these lose: 'sea surface temperature' means sst, not
+# the sst anomaly or the sst error.
+_DERIVED = re.compile(r"\b(anomal\w*|errors?|uncertaint\w*|std|stdev|deviations?|sigma|bias|"
+                      r"count|number|mask|flags?|quality|climatolog\w*|trend|rms\w*|variance|"
+                      r"probabilit\w*)\b")
+
+
+def _rank_key(v: dict, term: str) -> tuple:
+    """Sort key for variables that match `term` (smaller is better): match strength, then
+    plain quantity before derived ones (anomaly/error/...), then fewest extra words."""
+    t = _norm(term)
+    a = v.get("attributes") or {}
+    text = f"{_norm(v['name'])} {_norm(a.get('standard_name'))} {_norm(a.get('long_name'))}"
+    derived = 1 if _DERIVED.search(text) and not _DERIVED.search(t) else 0
+    extra = len(set(_norm(a.get("long_name")).split()) - set(t.split()))
+    return (-_match_score(v, term), derived, extra)
+
+
 def _grid_info(v: dict, sp: dict) -> dict:
     """Is the variable on a regular lat/lon grid (so bbox subsetting can work), and how fine."""
     dims = [str(d) for d in (v.get("dimensions") or [])]
@@ -797,7 +857,13 @@ def _window_days(tt) -> float | None:
     return max((_ts(_time_bound(tt[1], True)) - _ts(_time_bound(tt[0], False))).total_seconds() / 86400, 0)
 
 
-def compare_datasets(ctx: ToolContext, dataset_ids: list, variable=None, bbox=None, time=None) -> dict:
+# With prefer="resolution", only candidates that cover at least this fraction of the requested
+# region x period compete on grid spacing; the others cannot be the answer however fine their grid.
+_MIN_COVER_FOR_RESOLUTION = 0.8
+
+
+def compare_datasets(ctx: ToolContext, dataset_ids: list, variable=None, bbox=None, time=None,
+                     prefer="coverage") -> dict:
     if len(set(dataset_ids)) < 2 or len(set(dataset_ids)) > 4:
         return err("bad_request", "Give between 2 and 4 different dataset_ids.")
     bb, tt = _bbox_tuple(bbox), _time_tuple(time)
@@ -812,19 +878,28 @@ def compare_datasets(ctx: ToolContext, dataset_ids: list, variable=None, bbox=No
         flags: list[str] = []
         eligible = True
         coarse = False
+        t_step = _dataset_time_step(rec)
+        t_cover = _time_cover(tp, tt, t_step)
         row: dict[str, Any] = {
             "dataset_id": did,
             "title": _trim((rec.get("global_attributes") or {}).get("title"), 100),
             "format": rec.get("format"),
             "period": [tp.get("start"), tp.get("end")],
             "extent": sp or None,
-            "coverage": {"space": _space_cover(sp, bb), "time": _time_cover(tp, tt)},
+            "coverage": {"space": _space_cover(sp, bb), "time": t_cover},
         }
+        if t_step is not None:
+            row["time_resolution"] = _time_resolution(t_step)
+        row["_step"] = math.inf          # grid spacing in degrees (coarser axis); inf = unknown
         if tp.get("start") and tp.get("start") == tp.get("end"):
             flags.append(f"single time step ({str(tp['start'])[:10]})")
+        elif t_cover == 1.0 and _time_cover(tp, tt, None) != 1.0:
+            flags.append(f"{_time_resolution(t_step)} time axis stamped {str(tp['start'])[:10]} to "
+                         f"{str(tp['end'])[:10]}: each time stamp stands for its whole period, so "
+                         "the requested period counts as fully covered")
         if variable:
             ranked = sorted(((_match_score(v, variable), v) for v in rec.get("variables", [])),
-                            key=lambda x: -x[0])
+                            key=lambda x: _rank_key(x[1], variable))
             ranked = [(s_, v) for s_, v in ranked if s_ > 0]
             if not ranked:
                 flags.append(f"no variable matches '{variable}'")
@@ -837,6 +912,9 @@ def compare_datasets(ctx: ToolContext, dataset_ids: list, variable=None, bbox=No
                 row["match_strength"] = ranked[0][0]
                 grid = _grid_info(best, sp)
                 row["grid"] = grid
+                steps = [grid[k] for k in ("lat_step_deg", "lon_step_deg") if grid.get(k)]
+                if steps:
+                    row["_step"] = max(steps)
 
                 step = _time_step_days(best, tp)
                 if step is not None:
@@ -846,7 +924,8 @@ def compare_datasets(ctx: ToolContext, dataset_ids: list, variable=None, bbox=No
                     flags.append(f"time step is about {step:g} days, longer than the requested "
                                  f"period ({win:g} days): the period may contain no time step")
 
-                if len([1 for x, _ in ranked if x == ranked[0][0]]) > 1:
+                best_key = _rank_key(best, variable)
+                if len([1 for _, x in ranked if _rank_key(x, variable) == best_key]) > 1:
                     flags.append(f"several variables match equally well; showing '{best['name']}'")
                 if bb and not grid["gridded"]:
                     flags.append("variable is not on a regular lat/lon grid (dims: "
@@ -880,13 +959,34 @@ def compare_datasets(ctx: ToolContext, dataset_ids: list, variable=None, bbox=No
     if not rows:
         return err("unknown_dataset", "None of the dataset_ids exist.", unknown=unknown)
 
-    # eligible first, then time step fine enough for the period, then coverage, then strength
-    # of the variable match. The number of flags is NOT a criterion: a flag informs, it does
+    # Ranking. The number of flags is NOT a criterion in either mode: a flag informs, it does
     # not say whether a dataset fits the task.
-    rows.sort(key=lambda r: (not r["_eligible"], r["_coarse"], -r["_score"],
-                             -(r.get("match_strength") or 0)))
+    #  prefer="coverage" (default): eligible first, then time step fine enough for the period,
+    #      then coverage of region x period, then strength of the variable match.
+    #  prefer="resolution": eligible first, then time step fine enough for the period, then
+    #      candidates covering at least _MIN_COVER_FOR_RESOLUTION of the request, finest grid first;
+    #      coverage and match strength break ties.
+    for r in rows:
+        r["_qual"] = r["_eligible"] and r["_score"] >= _MIN_COVER_FOR_RESOLUTION
+    by_resolution = (prefer == "resolution"
+                     and any(r["_qual"] and math.isfinite(r["_step"]) for r in rows))
+    note = None
+    if prefer == "resolution" and not by_resolution:
+        note = ("prefer='resolution' could not be applied: no eligible candidate covers at least "
+                f"{_MIN_COVER_FOR_RESOLUTION:.0%} of the request with a known grid spacing, so the "
+                "candidates are ranked by coverage.")
+    if by_resolution:
+        rows.sort(key=lambda r: (not r["_eligible"], r["_coarse"], not r["_qual"],
+                                 r["_step"] if r["_qual"] else 0.0,
+                                 -r["_score"], -(r.get("match_strength") or 0)))
+    else:
+        rows.sort(key=lambda r: (not r["_eligible"], r["_coarse"], -round(r["_score"], 2),
+                                 r["_step"], -(r.get("match_strength") or 0)))
     good = [r for r in rows if r["_eligible"]]
-    out: dict[str, Any] = {"ok": True, "n": len(rows)}
+    out: dict[str, Any] = {"ok": True, "n": len(rows),
+                           "prefer": "resolution" if by_resolution else "coverage"}
+    if note:
+        out["note"] = note
     if not good:
         out["recommended"] = None
         out["recommendation"] = ("No candidate fits: each fails on variable, grid or coverage (see flags). "
@@ -894,31 +994,57 @@ def compare_datasets(ctx: ToolContext, dataset_ids: list, variable=None, bbox=No
                                  "without telling the user.")
     else:
         top = good[0]
+        sec = good[1] if len(good) > 1 else None
         out["recommended"] = top["dataset_id"]
-        close = (len(good) > 1 and top["_coarse"] == good[1]["_coarse"]
-                 and (top["_score"] - good[1]["_score"]) < 0.1)
+        if by_resolution:
+            close = (sec is not None and sec["_qual"] and sec["_coarse"] == top["_coarse"]
+                     and math.isfinite(sec["_step"]) and top["_step"] >= 0.9 * sec["_step"])
+            text = (f"finest grid ({top['_step']:g} deg) among the candidates that cover at least "
+                    f"{_MIN_COVER_FOR_RESOLUTION:.0%} of the requested region x period; "
+                    f"it covers {top['_score']:.0%}")
+            if sec is not None and sec["_qual"] and math.isfinite(sec["_step"]):
+                text += f"; next finest {sec['_step']:g} deg"
+            out["recommendation"] = text + "."
+            if top["_score"] < 1:
+                out["recommendation"] += (" It does not cover the whole request: say so in the answer, "
+                                          "and name the more complete alternative if there is one.")
+            if close:
+                out["recommendation"] += (" Grid spacing is almost the same: decide on coverage, "
+                                          "units and flags.")
+        else:
+            close = (sec is not None and top["_coarse"] == sec["_coarse"]
+                     and (top["_score"] - sec["_score"]) < 0.1)
+            why = [f"covers {top['_score']:.0%} of the requested region x period"]
+            if sec is not None:
+                why.append(f"next best covers {sec['_score']:.0%}")
+            out["recommendation"] = "; ".join(why) + "."
+            if close:
+                out["recommendation"] += (" Candidates are close on coverage: decide on grid spacing, "
+                                          "units and flags against what the user asked for.")
         out["confidence"] = "close" if close else "clear"
-        why = [f"covers {top['_score']:.0%} of the requested region x period"]
-        if len(good) > 1:
-            why.append(f"next best covers {good[1]['_score']:.0%}")
-        out["recommendation"] = "; ".join(why) + "."
-        if len(good) > 1 and good[1]["_coarse"] and not top["_coarse"]:
+        if sec is not None and sec["_coarse"] and not top["_coarse"]:
             out["recommendation"] += (" The alternatives have a time step longer than the requested "
                                       "period, so they may contain no data for it.")
         if top["_coarse"]:
             out["recommendation"] += (" Every eligible candidate has a time step longer than the "
                                       "requested period: tell the user the result will be coarser "
                                       "than asked, or that it may be empty.")
-        if close:
-            out["recommendation"] += (" Candidates are close on coverage: decide on grid spacing, "
-                                      "units and flags against what the user asked for.")
     for r in rows:
-        r.pop("_score"), r.pop("_eligible"), r.pop("_coarse")
+        for k in ("_score", "_eligible", "_coarse", "_qual", "_step"):
+            r.pop(k, None)
     out["datasets"] = rows
-    out["ranking_basis"] = ("fit first (variable matches, regular lat/lon grid when a region is "
-                            "requested, some coverage), then time step not longer than the requested "
-                            "period, then coverage of region x period. Grid spacing and units are shown "
-                            "but not ranked: judge them against the task.")
+    if by_resolution:
+        out["ranking_basis"] = ("fit first (variable matches, regular lat/lon grid when a region is "
+                                "requested, some coverage), then time step not longer than the requested "
+                                f"period, then, among candidates covering at least "
+                                f"{_MIN_COVER_FOR_RESOLUTION:.0%} of region x period, the finest grid "
+                                "(coarser of the lat and lon spacing), then coverage.")
+    else:
+        out["ranking_basis"] = ("fit first (variable matches, regular lat/lon grid when a region is "
+                                "requested, some coverage), then time step not longer than the requested "
+                                "period, then coverage of region x period (equal coverage: the finer grid "
+                                "wins). Units are shown but not ranked: judge them against the task, or call "
+                                "again with prefer='resolution' if the user asked for high resolution.")
     if unknown:
         out["unknown_dataset_ids"] = unknown
     return out
@@ -1023,12 +1149,18 @@ def build_registry(ctx: ToolContext) -> ToolRegistry:
         "the requested region and period each covers, the matching variable with units, grid "
         "spacing, NaN fraction, whether it is on a regular lat/lon grid, and flags (partial "
         "coverage, suspicious statistics). Returns `recommended` (a dataset_id or null) with the "
-        "reason. Use it after search_catalog when there are 2 or more candidates.",
+        "reason. Use it after search_catalog when there are 2 or more candidates. Set "
+        "prefer='resolution' only if the user asked for high resolution.",
         {"type": "object", "properties": {
             "dataset_ids": {"type": "array", "items": {"type": "string"}, "minItems": 2,
                             "description": "dataset_ids returned by search_catalog."},
             "variable": {"type": "string", "description": "Topic or variable name, e.g. 'sea surface temperature'."},
             "bbox": BBOX_SCHEMA, "time": TIME_SCHEMA,
+            "prefer": {"type": "string", "enum": ["coverage", "resolution"], "default": "coverage",
+                       "description": ("'coverage' (default): rank by how much of the region and period "
+                                       "is covered. 'resolution': use it only when the user asks for "
+                                       "high or fine resolution or detail; then the finest grid wins "
+                                       "among candidates that cover most of the request.")},
         }, "required": ["dataset_ids"]},
         compare_datasets))
     return reg
