@@ -323,13 +323,13 @@ The step-by-step trace goes to **stderr**, the final answer to **stdout**, so yo
 
 For a task like the examples above, a typical run is:
 
-1. `resolve_time_range`: turns "2026" or "last 5 years" into exact dates (computed in code, not by the LLM).
+1. `resolve_time_range`: turns a relative period ("the last 5 years") into exact dates (arguments `last_amount`, `last_unit`; computed in code, not by the LLM). Explicit periods, including whole calendar years such as "2026", are written by the model as ISO dates and the tool is not called.
 2. `search_catalog`: topic as free text, region/period/format as structured filters.
 3. `compare_datasets`: compares 2 to 4 candidates (coverage of region and period, variable match, gridded or not) and recommends one. Optional.
 4. `get_dataset`: details of one dataset (extent, variables, units, chunking, statistics).
 5. `estimate_subset_size`: size of the result and bytes that must be read, **without reading data**.
 6. `subset_dataset`: writes the subset as Zarr or NetCDF. It is refused unless that exact request was estimated first.
-7. `verify_subset`: checks the written file (empty or all-NaN data, NaN fraction, infinite or constant values, units, values outside the catalog range, coordinates outside the requested region and period).
+7. `verify_subset`: checks the written file (empty or all-NaN data, NaN fraction, infinite or constant values, units, values outside the catalog range, fill-value sentinels in the written data, coordinates outside the requested region and period).
 
 Rules the code enforces regardless of the model:
 
@@ -433,9 +433,10 @@ The tests need neither a running Qdrant server nor a real LLM. They do not cover
 ## Known limitations
 
 - **Only pre-ingested datasets.** The agent does not ingest sources by itself; ingest through the web app first.
-- **Statistics for large variables.** The size guard in `extractors.py` is currently inactive, so every numeric variable is loaded into memory during ingestion. Large datasets may be slow or fail at ingestion.
-- **Fill values in statistics.** If a dataset's fill value is not masked (for example a sentinel of −1000 in sea-ice cells), its catalog min, mean and std are wrong, and the range check in `verify_subset` cannot catch leaked fill values. `compare_datasets` flags this case.
+- **Statistics for large variables.** The `MAX_STAT_ELEMENTS` size guard in `_compute_statistics` (`extractors.py`) is inside a string literal and never runs, so every numeric variable is loaded into memory during ingestion. Large datasets may be slow or fail at ingestion.
+- **Temporal extent.** The extractor recognises only `time`, `times`, `date` and `t` as time coordinates. ERA5 `valid_time` gives no temporal extent in the catalog (the subsetting module and `compare_datasets` do recognise `valid_time`).
+- **Fill values in statistics.** If a dataset's fill value is not masked (for example a sentinel of −1000 in sea-ice cells), its catalog min, mean and std are wrong. `verify_subset` skips the catalog range check for a variable whose catalog statistics look like an unmasked fill value (|v| ≥ 1e10 or close to −999, −9999, −1000, −32768, 9.96921e36, ...) and adds a note. Independently of the catalog, it scans the min/max of the written subset with the same heuristic and reports `sentinel_value` (`verified=false`). The result includes `checks` (`catalog_range`, `sentinel_scan`, `coordinates_vs_request`) and `notes`. Remaining limit: values that are implausible but neither a known sentinel nor outside the catalog range pass. `compare_datasets` also flags this case.
 - **Projected grids.** `x`/`y` are accepted as lat/lon candidates at ingestion, which gives a meaningless extent on projected grids; subsetting rejects them.
-- **Datasets crossing ±180°** may get inverted longitude bounds in the catalog.
+- **Datasets crossing ±180°.** `normalize_lon_range` leaves ranges inside [−180, 180] unchanged, maps ranges spanning ≥ 359 degrees to the global range, and wraps the others. If the wrapped range would cross the ±180° boundary (west bound > east bound), it is widened to the global range [−180, 180]: false positives are accepted, misses are not.
 - **Write-time rate limits.** Retries cover opening a source only. If a server rate-limits chunk reads while writing, the error is `write_failed` and is not treated as an outage.
 - **Datetime filters and nanoseconds.** Timestamps stored with nanosecond precision are excluded by in-memory Qdrant datetime filters. Verify against your server or truncate timestamps to seconds at ingestion.
